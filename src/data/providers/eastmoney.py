@@ -74,7 +74,11 @@ def _parse_kline_records(klines: list[Any]) -> pd.DataFrame:
     return pd.DataFrame(records, columns=KLINE_COLUMNS)
 
 
-def get_daily_kline(symbol: str) -> pd.DataFrame:
+def get_daily_kline(
+    symbol: str,
+    *,
+    limit: int = 100,
+) -> pd.DataFrame:
     """Return recent daily K-line data for an A-share stock.
 
     Args:
@@ -90,11 +94,18 @@ def get_daily_kline(symbol: str) -> pd.DataFrame:
     """
     market = _get_market_code(symbol)
 
+    if (
+        not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or limit <= 0
+    ):
+        raise ValueError(f"Invalid K-line limit: {limit!r}")
+
     params = {
         "secid": f"{market}.{symbol}",
         "klt": "101",
         "fqt": "1",
-        "lmt": "100",
+        "lmt": str(limit),
         "end": "20500101",
         "fields1": "f1,f2,f3,f4,f5,f6",
         "fields2": (
