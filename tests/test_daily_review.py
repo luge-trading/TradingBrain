@@ -6,20 +6,20 @@ import src.engine.daily_review as dr
 
 def test_validate_and_normalize_symbols_success():
     symbols = ["000021", " 600584 ", "000021"]
-    out = dr._validate_and_normalize_symbols(symbols)
-    assert out == ["000021", "600584"]
+    out = dr.normalize_symbols(symbols)
+    assert out == ("000021", "600584")
 
 
 @pytest.mark.parametrize("bad", [[], (), None])
 def test_empty_symbols_rejected(bad):
     with pytest.raises(ValueError):
-        dr._validate_and_normalize_symbols(bad)
+        dr.normalize_symbols(bad)
 
 
 @pytest.mark.parametrize("bad", ["abc", "123", "1234567", 123456])
 def test_invalid_codes_rejected(bad):
     with pytest.raises(ValueError):
-        dr._validate_and_normalize_symbols([bad])
+        dr.normalize_symbols([bad])
 
 
 def test_limit_validation():
@@ -172,9 +172,105 @@ def test_cli_and_daily_review_consistent_arguments(monkeypatch):
     assert cli_rc == dr_rc
     assert cli_rc == 0
     assert len(captured) == 2
-    assert captured[0][0] == ["000021"]
+    assert captured[0][0] == ("000021",)
     assert captured[0][1]["database_path"] == "/tmp/db.sqlite"
     assert captured[0][1]["output_dir"] == "/tmp/reports"
     assert captured[0][1]["limit"] == 10
     assert captured[0][1]["update_data"] is False
     assert captured[1] == captured[0]
+
+
+def test_cli_watchlist_source_and_custom_path(monkeypatch, capsys, tmp_path):
+    toml_path = tmp_path / "watchlist.toml"
+    toml_path.write_text('version = 1\nsymbols = ["000021", "600584", "000021"]\n', encoding="utf-8")
+
+    def fake_run(symbols, **kwargs):
+        assert symbols == ("000021", "600584")
+        return dr.DailyReviewResult(outcomes=(
+            dr.StockReviewOutcome("000021", True, Path(tmp_path / "000021.md"), None),
+            dr.StockReviewOutcome("600584", True, Path(tmp_path / "600584.md"), None),
+        ))
+
+    monkeypatch.setattr(dr, 'run_daily_review', fake_run)
+
+    rc = cli.main(["--watchlist", str(toml_path), "--no-update"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "自选股来源: " in captured.out
+    assert str(toml_path) in captured.out
+    assert "000021 成功" in captured.out
+    assert "600584 成功" in captured.out
+
+
+def test_cli_symbols_without_watchlist(monkeypatch, capsys):
+    def fake_run(symbols, **kwargs):
+        assert symbols == ("000021",)
+        return dr.DailyReviewResult(outcomes=(
+            dr.StockReviewOutcome("000021", True, Path("/tmp/000021.md"), None),
+        ))
+
+    monkeypatch.setattr(dr, 'run_daily_review', fake_run)
+
+    rc = cli.main(["--symbols", "000021"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "自选股来源: 命令行" in captured.out
+    assert "000021 成功" in captured.out
+
+
+def test_watchlist_load_failure_returns_nonzero(monkeypatch, capsys):
+    def fake_load(path):
+        raise FileNotFoundError("missing")
+
+    called = {"run_daily_review": False}
+
+    def fake_run(symbols, **kwargs):
+        called["run_daily_review"] = True
+        return dr.DailyReviewResult(outcomes=())
+
+    monkeypatch.setattr(dr, 'load_watchlist', fake_load)
+    monkeypatch.setattr(dr, 'run_daily_review', fake_run)
+
+    rc = cli.main(["--watchlist", "/tmp/missing.toml"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "Error: missing" in captured.err
+    assert called["run_daily_review"] is False
+
+
+def test_cli_default_watchlist_reads_config_and_passes_paths(monkeypatch, capsys):
+    from src.config.watchlist import WatchlistConfig
+
+    config = WatchlistConfig(
+        path=Path("config/watchlist.toml"),
+        version=1,
+        symbols=("000021",),
+    )
+
+    def fake_load(path):
+        assert Path(path) == Path("config/watchlist.toml")
+        return config
+
+    def fake_run(symbols, **kwargs):
+        assert symbols == ("000021",)
+        assert kwargs["database_path"] is not None
+        assert kwargs["output_dir"] is not None
+        return dr.DailyReviewResult(outcomes=(
+            dr.StockReviewOutcome("000021", True, Path("/tmp/000021.md"), None),
+        ))
+
+    monkeypatch.setattr(dr, 'load_watchlist', fake_load)
+    monkeypatch.setattr(dr, 'run_daily_review', fake_run)
+
+    rc = cli.main([])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "自选股来源: config/watchlist.toml" in captured.out
+    assert "000021 成功" in captured.out
+
+
+def test_cli_symbols_and_watchlist_are_mutually_exclusive():
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--symbols", "000021", "--watchlist", "config/watchlist.toml"])
+    assert exc.value.code == 2

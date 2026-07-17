@@ -13,6 +13,7 @@ from typing import Iterable, Tuple
 
 from src.report.stock_report import generate_stock_report
 from src.data.database import DEFAULT_DATABASE_PATH
+from src.config.watchlist import DEFAULT_WATCHLIST_PATH, load_watchlist, normalize_symbols
 
 
 @dataclass(frozen=True)
@@ -40,40 +41,6 @@ class DailyReviewResult:
         return sum(1 for o in self.outcomes if not o.success)
 
 
-def _validate_and_normalize_symbols(symbols: Iterable[str]) -> list[str]:
-    if symbols is None:
-        raise ValueError("symbols must be provided and contain at least one code")
-
-    if isinstance(symbols, str):
-        raise ValueError("symbols must be an iterable of stock code strings, not a single string")
-
-    try:
-        items = list(symbols)
-    except TypeError:
-        raise ValueError("symbols must be an iterable of stock code strings")
-
-    if not items:
-        raise ValueError("symbols must contain at least one stock code")
-
-    seen: set[str] = set()
-    out: list[str] = []
-
-    for raw in items:
-        if not isinstance(raw, str):
-            raise ValueError(f"Invalid stock code (not a string): {raw!r}")
-        code = raw.strip()
-        if not code:
-            raise ValueError("Empty stock code is not allowed")
-        if len(code) != 6 or not code.isdigit():
-            raise ValueError(f"Invalid stock code: {code!r}")
-        if code in seen:
-            continue
-        seen.add(code)
-        out.append(code)
-
-    return out
-
-
 def run_daily_review(
     symbols: Iterable[str],
     *,
@@ -96,7 +63,7 @@ def run_daily_review(
     if database_path is None or output_dir is None:
         raise ValueError("database_path and output_dir must not be None")
 
-    normalized = _validate_and_normalize_symbols(symbols)
+    normalized = normalize_symbols(symbols)
 
     outcomes: list[StockReviewOutcome] = []
 
@@ -118,7 +85,9 @@ def run_daily_review(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="src.engine.daily_review", description="Batch daily review for multiple stocks")
-    parser.add_argument("--symbols", nargs="+", required=True, help="Stock codes (one or more, 6-digit)")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--symbols", nargs="+", help="Stock codes (one or more, 6-digit)")
+    group.add_argument("--watchlist", help="Path to watchlist TOML file")
     parser.add_argument("--database-path", dest="database_path", default=DEFAULT_DATABASE_PATH, help="Path to SQLite database")
     parser.add_argument("--output-dir", dest="output_dir", default="reports", help="Output directory for reports")
     parser.add_argument("--limit", type=int, default=500, help="Max historical rows to fetch per stock")
@@ -131,9 +100,26 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     update_data = not bool(args.no_update)
 
+    if args.symbols is not None:
+        symbols = normalize_symbols(args.symbols)
+        source = "命令行"
+    else:
+        watchlist_path = Path(args.watchlist) if args.watchlist else DEFAULT_WATCHLIST_PATH
+        try:
+            config = load_watchlist(watchlist_path)
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        symbols = config.symbols
+        source = str(config.path)
+
+    if not symbols:
+        print("Error: No symbols provided or loaded from watchlist", file=sys.stderr)
+        return 2
+
     try:
         result = run_daily_review(
-            args.symbols,
+            symbols,
             database_path=args.database_path,
             output_dir=args.output_dir,
             update_data=update_data,
@@ -145,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
+    print(f"自选股来源: {source}")
     print("批量复盘完成")
     print(f"总数: {result.total_count}")
     print(f"成功: {result.success_count}")
