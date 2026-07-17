@@ -4,6 +4,14 @@ from pathlib import Path
 import src.engine.daily_review as dr
 
 
+def test_src_engine_public_api_compatibility():
+    from src.engine import run_daily_review, StockReviewOutcome, DailyReviewResult
+
+    assert run_daily_review is dr.run_daily_review
+    assert StockReviewOutcome is dr.StockReviewOutcome
+    assert DailyReviewResult is dr.DailyReviewResult
+
+
 def test_validate_and_normalize_symbols_success():
     symbols = ["000021", " 600584 ", "000021"]
     out = dr.normalize_symbols(symbols)
@@ -127,7 +135,11 @@ def test_cli_all_success(monkeypatch, capsys, tmp_path):
         outcomes = tuple(dr.StockReviewOutcome(s, True, Path(tmp_path / f"{s}.md"), None) for s in symbols)
         return dr.DailyReviewResult(outcomes=outcomes)
 
+    def fake_summary(result, **kwargs):
+        return Path(tmp_path / "2026-07-17-daily-summary.md")
+
     monkeypatch.setattr(dr, 'run_daily_review', fake_run)
+    monkeypatch.setattr(dr, 'generate_daily_summary', fake_summary)
 
     rc = cli.main(["--symbols", "000021", "600584", "600420", "--no-update"]) 
     captured = capsys.readouterr()
@@ -136,6 +148,31 @@ def test_cli_all_success(monkeypatch, capsys, tmp_path):
     assert "成功: 3" in captured.out
     assert "失败: 0" in captured.out
     assert "000021 成功" in captured.out
+    assert "汇总报告: " in captured.out
+
+
+def test_cli_partial_failure_still_generates_summary(monkeypatch, capsys, tmp_path):
+    def fake_run(symbols, **kwargs):
+        outcomes = (
+            dr.StockReviewOutcome("000021", True, Path(tmp_path / "000021.md"), None),
+            dr.StockReviewOutcome("600584", False, None, "no data"),
+        )
+        return dr.DailyReviewResult(outcomes=outcomes)
+
+    def fake_summary(result, **kwargs):
+        return Path(tmp_path / "2026-07-17-daily-summary.md")
+
+    monkeypatch.setattr(dr, 'run_daily_review', fake_run)
+    monkeypatch.setattr(dr, 'generate_daily_summary', fake_summary)
+
+    rc = cli.main(["--symbols", "000021", "600584"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "总数: 2" in captured.out
+    assert "成功: 1" in captured.out
+    assert "失败: 1" in captured.out
+    assert "汇总报告: " in captured.out
+    assert "600584 失败 no data" in captured.out
 
 
 def test_cli_partial_failure(monkeypatch, capsys, tmp_path):
@@ -146,9 +183,13 @@ def test_cli_partial_failure(monkeypatch, capsys, tmp_path):
         )
         return dr.DailyReviewResult(outcomes=outcomes)
 
-    monkeypatch.setattr(dr, 'run_daily_review', fake_run)
+    def fake_summary(result, **kwargs):
+        return Path(tmp_path / "2026-07-17-daily-summary.md")
 
-    rc = cli.main(["--symbols", "000021", "600584"]) 
+    monkeypatch.setattr(dr, 'run_daily_review', fake_run)
+    monkeypatch.setattr(dr, 'generate_daily_summary', fake_summary)
+
+    rc = cli.main(["--symbols", "000021", "600584"])
     captured = capsys.readouterr()
     assert rc == 1
     assert "总数: 2" in captured.out
@@ -191,7 +232,11 @@ def test_cli_watchlist_source_and_custom_path(monkeypatch, capsys, tmp_path):
             dr.StockReviewOutcome("600584", True, Path(tmp_path / "600584.md"), None),
         ))
 
+    def fake_summary(result, **kwargs):
+        return Path(tmp_path / "2026-07-17-daily-summary.md")
+
     monkeypatch.setattr(dr, 'run_daily_review', fake_run)
+    monkeypatch.setattr(dr, 'generate_daily_summary', fake_summary)
 
     rc = cli.main(["--watchlist", str(toml_path), "--no-update"])
     captured = capsys.readouterr()
@@ -200,6 +245,7 @@ def test_cli_watchlist_source_and_custom_path(monkeypatch, capsys, tmp_path):
     assert str(toml_path) in captured.out
     assert "000021 成功" in captured.out
     assert "600584 成功" in captured.out
+    assert "汇总报告: " in captured.out
 
 
 def test_cli_symbols_without_watchlist(monkeypatch, capsys):
@@ -209,13 +255,18 @@ def test_cli_symbols_without_watchlist(monkeypatch, capsys):
             dr.StockReviewOutcome("000021", True, Path("/tmp/000021.md"), None),
         ))
 
+    def fake_summary(result, **kwargs):
+        return Path("/tmp/2026-07-17-daily-summary.md")
+
     monkeypatch.setattr(dr, 'run_daily_review', fake_run)
+    monkeypatch.setattr(dr, 'generate_daily_summary', fake_summary)
 
     rc = cli.main(["--symbols", "000021"])
     captured = capsys.readouterr()
     assert rc == 0
     assert "自选股来源: 命令行" in captured.out
     assert "000021 成功" in captured.out
+    assert "汇总报告: " in captured.out
 
 
 def test_watchlist_load_failure_returns_nonzero(monkeypatch, capsys):
@@ -238,7 +289,7 @@ def test_watchlist_load_failure_returns_nonzero(monkeypatch, capsys):
     assert called["run_daily_review"] is False
 
 
-def test_cli_default_watchlist_reads_config_and_passes_paths(monkeypatch, capsys):
+def test_cli_default_watchlist_reads_config_and_passes_paths(monkeypatch, capsys, tmp_path):
     from src.config.watchlist import WatchlistConfig
 
     config = WatchlistConfig(
@@ -259,8 +310,12 @@ def test_cli_default_watchlist_reads_config_and_passes_paths(monkeypatch, capsys
             dr.StockReviewOutcome("000021", True, Path("/tmp/000021.md"), None),
         ))
 
+    def fake_summary(result, **kwargs):
+        return Path(tmp_path / "2026-07-17-daily-summary.md")
+
     monkeypatch.setattr(dr, 'load_watchlist', fake_load)
     monkeypatch.setattr(dr, 'run_daily_review', fake_run)
+    monkeypatch.setattr(dr, 'generate_daily_summary', fake_summary)
 
     rc = cli.main([])
     captured = capsys.readouterr()
@@ -274,3 +329,42 @@ def test_cli_symbols_and_watchlist_are_mutually_exclusive():
     with pytest.raises(SystemExit) as exc:
         cli.main(["--symbols", "000021", "--watchlist", "config/watchlist.toml"])
     assert exc.value.code == 2
+
+
+def test_cli_summary_generation_failure_returns_nonzero(monkeypatch, capsys, tmp_path):
+    def fake_run(symbols, **kwargs):
+        return dr.DailyReviewResult(outcomes=(
+            dr.StockReviewOutcome("000021", True, Path(tmp_path / "000021.md"), None),
+        ))
+
+    def fake_summary(result, **kwargs):
+        raise RuntimeError("summary failed")
+
+    monkeypatch.setattr(dr, 'run_daily_review', fake_run)
+    monkeypatch.setattr(dr, 'generate_daily_summary', fake_summary)
+
+    rc = cli.main(["--symbols", "000021"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Error: summary failed" in captured.err
+
+
+def test_cli_all_failed_still_generates_summary(monkeypatch, capsys, tmp_path):
+    def fake_run(symbols, **kwargs):
+        return dr.DailyReviewResult(outcomes=(
+            dr.StockReviewOutcome("000021", False, None, "no data"),
+            dr.StockReviewOutcome("600584", False, None, "no data"),
+        ))
+
+    def fake_summary(result, **kwargs):
+        return Path(tmp_path / "2026-07-17-daily-summary.md")
+
+    monkeypatch.setattr(dr, 'run_daily_review', fake_run)
+    monkeypatch.setattr(dr, 'generate_daily_summary', fake_summary)
+
+    rc = cli.main(["--symbols", "000021", "600584"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "汇总报告: " in captured.out
+    assert "000021 失败 no data" in captured.out
+    assert "600584 失败 no data" in captured.out

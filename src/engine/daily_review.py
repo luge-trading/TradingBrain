@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Tuple
 
+from src.report.daily_summary import generate_daily_summary
 from src.report.stock_report import generate_stock_report
 from src.data.database import DEFAULT_DATABASE_PATH
 from src.config.watchlist import DEFAULT_WATCHLIST_PATH, load_watchlist, normalize_symbols
@@ -144,7 +145,24 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"{o.symbol} 失败 {o.error}")
 
-    return 0 if result.failure_count == 0 else 1
+    summary_meta: dict[str, int] = {}
+    try:
+        summary_path = generate_daily_summary(
+            result,
+            database_path=args.database_path,
+            output_dir=args.output_dir,
+            watchlist_source=source,
+            summary_meta=summary_meta,
+        )
+        print(f"汇总报告: {summary_path}")
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if result.failure_count > 0 or summary_meta.get("analysis_failures", 0) > 0:
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
