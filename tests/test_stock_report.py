@@ -146,3 +146,53 @@ def test_insufficient_history_observation(tmp_path):
     text = path.read_text(encoding="utf-8")
 
     assert "历史数据不足，暂无法形成该观察条件" in text
+
+
+def test_cli_default_paths_do_not_pass_none(monkeypatch):
+    # patch the generate_stock_report used by CLI
+    import src.report.__main__ as cli
+
+    called = {}
+
+    def fake_generate(symbol, *, database_path=None, output_dir=None, update_data=True, limit=500):
+        called['database_path'] = database_path
+        called['output_dir'] = output_dir
+        return Path('/tmp/fake.md')
+
+    monkeypatch.setattr(cli, 'generate_stock_report', fake_generate)
+
+    rc = cli.main(['000021', '--no-update'])
+    assert rc == 0
+    assert called['database_path'] is not None
+    assert called['output_dir'] is not None
+
+
+def test_cli_custom_paths_passed(monkeypatch, tmp_path):
+    import src.report.__main__ as cli
+
+    captured = {}
+
+    def fake_generate(symbol, *, database_path=None, output_dir=None, update_data=True, limit=500):
+        captured['database_path'] = database_path
+        captured['output_dir'] = output_dir
+        return Path(tmp_path / 'x.md')
+
+    monkeypatch.setattr(cli, 'generate_stock_report', fake_generate)
+
+    dbp = str(tmp_path / 'db.sqlite')
+    outp = str(tmp_path / 'reports')
+    rc = cli.main(['000021', '--database-path', dbp, '--output-dir', outp, '--no-update'])
+    assert rc == 0
+    assert captured['database_path'] == dbp
+    assert captured['output_dir'] == outp
+
+
+def test_cli_error_returns_nonzero(monkeypatch):
+    import src.report.__main__ as cli
+
+    def fake_generate(symbol, **kwargs):
+        raise RuntimeError('fail')
+
+    monkeypatch.setattr(cli, 'generate_stock_report', fake_generate)
+    rc = cli.main(['000021', '--no-update'])
+    assert rc != 0

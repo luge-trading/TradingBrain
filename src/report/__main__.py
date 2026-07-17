@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from src.report import generate_stock_report
+from src.data.database import DEFAULT_DATABASE_PATH
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -23,11 +24,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        db_path = args.database_path if args.database_path is not None else None
+        db_path = args.database_path if args.database_path is not None else DEFAULT_DATABASE_PATH
+        out_dir = args.output_dir if args.output_dir is not None else "reports"
+
         path = generate_stock_report(
             args.symbol,
             database_path=db_path,
-            output_dir=args.output_dir,
+            output_dir=out_dir,
             update_data=(not args.no_update),
             limit=args.limit,
         )
