@@ -11,6 +11,7 @@ from typing import Final
 import pandas as pd
 
 from src.data.index import INDEX_KLINE_COLUMNS, get_index_definition, normalize_index_daily_kline
+from src.data.market import MarketDaily, calculate_advance_ratio, validate_trade_date
 
 
 DEFAULT_DATABASE_PATH: Final[Path] = Path("data/trading_brain.db")
@@ -98,6 +99,42 @@ ON CONFLICT(index_code, trade_date) DO UPDATE SET
     updated_at = excluded.updated_at;
 """
 
+CREATE_MARKET_DAILY_TABLE_SQL: Final[str] = """
+CREATE TABLE IF NOT EXISTS market_daily (
+    trade_date TEXT PRIMARY KEY,
+    sh_amount_yuan INTEGER NULL,
+    sz_amount_yuan INTEGER NULL,
+    total_amount_yuan INTEGER NULL,
+    advance_count INTEGER NULL,
+    decline_count INTEGER NULL,
+    flat_count INTEGER NULL,
+    sh_amount_source TEXT NULL,
+    sz_amount_source TEXT NULL,
+    breadth_source TEXT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+UPSERT_MARKET_DAILY_SQL: Final[str] = """
+INSERT INTO market_daily (
+    trade_date, sh_amount_yuan, sz_amount_yuan, total_amount_yuan,
+    advance_count, decline_count, flat_count,
+    sh_amount_source, sz_amount_source, breadth_source, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(trade_date) DO UPDATE SET
+    sh_amount_yuan = excluded.sh_amount_yuan,
+    sz_amount_yuan = excluded.sz_amount_yuan,
+    total_amount_yuan = excluded.total_amount_yuan,
+    advance_count = excluded.advance_count,
+    decline_count = excluded.decline_count,
+    flat_count = excluded.flat_count,
+    sh_amount_source = excluded.sh_amount_source,
+    sz_amount_source = excluded.sz_amount_source,
+    breadth_source = excluded.breadth_source,
+    updated_at = excluded.updated_at;
+"""
+
 
 def _validate_symbol(symbol: str) -> None:
     """Validate a six-digit stock code."""
@@ -128,6 +165,7 @@ def init_database(
         with sqlite3.connect(path) as connection:
             connection.execute(CREATE_STOCK_DAILY_TABLE_SQL)
             connection.execute(CREATE_INDEX_DAILY_TABLE_SQL)
+            connection.execute(CREATE_MARKET_DAILY_TABLE_SQL)
     except sqlite3.Error as exc:
         raise RuntimeError("Unable to initialize database") from exc
 
@@ -361,4 +399,133 @@ def get_latest_index_trade_date(
             ).fetchone()
     except sqlite3.Error as exc:
         raise RuntimeError(f"Unable to query latest index trade date for {index_code}") from exc
+    return None if row is None or row[0] is None else str(row[0])
+
+
+def save_market_daily(
+    record: MarketDaily,
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+) -> int:
+    """Idempotently store one validated market-day record."""
+    if not isinstance(record, MarketDaily):
+        raise TypeError("record must be a MarketDaily")
+    updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    values = (
+        record.trade_date,
+        record.sh_amount_yuan,
+        record.sz_amount_yuan,
+        record.total_amount_yuan,
+        record.advance_count,
+        record.decline_count,
+        record.flat_count,
+        record.sh_amount_source,
+        record.sz_amount_source,
+        record.breadth_source,
+        updated_at,
+    )
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            connection.execute(UPSERT_MARKET_DAILY_SQL, values)
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"Unable to save market daily data for {record.trade_date}") from exc
+    return 1
+
+
+def get_market_daily(
+    trade_date: str,
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+) -> MarketDaily | None:
+    """Load one market-day record as a validated value object."""
+    trade_date = validate_trade_date(trade_date)
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    query = """
+    SELECT trade_date, sh_amount_yuan, sz_amount_yuan, total_amount_yuan,
+           advance_count, decline_count, flat_count,
+           sh_amount_source, sz_amount_source, breadth_source
+    FROM market_daily WHERE trade_date = ?;
+    """
+    try:
+        with sqlite3.connect(path) as connection:
+            row = connection.execute(query, (trade_date,)).fetchone()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"Unable to load market daily data for {trade_date}") from exc
+    return None if row is None else MarketDaily(*row)
+
+
+def load_market_daily(
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    """Load market facts in date order and derive advance_ratio on read."""
+    if start_date is not None:
+        start_date = validate_trade_date(start_date)
+    if end_date is not None:
+        end_date = validate_trade_date(end_date)
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
+
+    conditions: list[str] = []
+    params: list[str] = []
+    if start_date is not None:
+        conditions.append("trade_date >= ?")
+        params.append(start_date)
+    if end_date is not None:
+        conditions.append("trade_date <= ?")
+        params.append(end_date)
+    where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = f"""
+    SELECT trade_date, sh_amount_yuan, sz_amount_yuan, total_amount_yuan,
+           advance_count, decline_count, flat_count,
+           sh_amount_source, sz_amount_source, breadth_source, updated_at
+    FROM market_daily{where} ORDER BY trade_date ASC;
+    """
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            result = pd.read_sql_query(query, connection, params=params)
+    except (sqlite3.Error, pd.errors.DatabaseError) as exc:
+        raise RuntimeError("Unable to load market daily data") from exc
+    for column in (
+        "sh_amount_yuan", "sz_amount_yuan", "total_amount_yuan",
+        "advance_count", "decline_count", "flat_count",
+    ):
+        result[column] = result[column].astype("Int64")
+    result["advance_ratio"] = [
+        calculate_advance_ratio(MarketDaily(
+            trade_date=row.trade_date,
+            sh_amount_yuan=None if pd.isna(row.sh_amount_yuan) else int(row.sh_amount_yuan),
+            sz_amount_yuan=None if pd.isna(row.sz_amount_yuan) else int(row.sz_amount_yuan),
+            total_amount_yuan=None if pd.isna(row.total_amount_yuan) else int(row.total_amount_yuan),
+            advance_count=None if pd.isna(row.advance_count) else int(row.advance_count),
+            decline_count=None if pd.isna(row.decline_count) else int(row.decline_count),
+            flat_count=None if pd.isna(row.flat_count) else int(row.flat_count),
+            sh_amount_source=row.sh_amount_source,
+            sz_amount_source=row.sz_amount_source,
+            breadth_source=row.breadth_source,
+        ))
+        for row in result.itertuples(index=False)
+    ]
+    return result
+
+
+def get_latest_market_trade_date(
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+) -> str | None:
+    """Return the latest stored market trade date."""
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            row = connection.execute("SELECT MAX(trade_date) FROM market_daily").fetchone()
+    except sqlite3.Error as exc:
+        raise RuntimeError("Unable to query latest market trade date") from exc
     return None if row is None or row[0] is None else str(row[0])

@@ -6,9 +6,23 @@ from unittest.mock import Mock
 import pandas as pd
 import pytest
 
-from src.data.database import load_daily_kline
+from src.data.database import get_market_daily, load_daily_kline, save_market_daily
 from src.data.database import load_index_daily_kline, save_index_daily_kline
-from src.data.update import IndexUpdateResult, UpdateResult, update_index_daily, update_stock_daily
+from src.data.market import (
+    SSE_AMOUNT_SOURCE,
+    SZSE_AMOUNT_SOURCE,
+    ExchangeDailyAmount,
+    MarketBreadth,
+    compose_market_daily,
+)
+from src.data.update import (
+    IndexUpdateResult,
+    MarketUpdateResult,
+    UpdateResult,
+    update_index_daily,
+    update_market_daily,
+    update_stock_daily,
+)
 
 
 def make_kline_data(dates: list[str]) -> pd.DataFrame:
@@ -309,3 +323,123 @@ def test_update_index_save_failure_preserves_data(tmp_path: Path, monkeypatch):
     with pytest.raises(RuntimeError, match=r"save.*SH000001"):
         update_index_daily("SH000001", database_path=database_path, fetcher=Mock(return_value=index_data(close=13.0)))
     assert len(load_index_daily_kline("SH000001", database_path=database_path)) == 2
+
+
+def market_fetchers(trade_date="2026-07-17", sh=100, sz=200, breadth=(3000, 1800, 200)):
+    return (
+        Mock(return_value=ExchangeDailyAmount(trade_date, sh, SSE_AMOUNT_SOURCE)),
+        Mock(return_value=ExchangeDailyAmount(trade_date, sz, SZSE_AMOUNT_SOURCE)),
+        Mock(return_value=MarketBreadth(*breadth)),
+    )
+
+
+def test_update_market_daily_stores_complete_amount_and_breadth_groups(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    sse, szse, breadth = market_fetchers()
+    result = update_market_daily(
+        "2026-07-17",
+        database_path=database_path,
+        sse_fetcher=sse,
+        szse_fetcher=szse,
+        breadth_fetcher=breadth,
+    )
+    assert isinstance(result, MarketUpdateResult)
+    assert result.errors == ()
+    assert result.attempted_record == result.stored_record
+    assert result.stored_record.total_amount_yuan == 300
+    assert result.stored_record.advance_count == 3000
+    sse.assert_called_once_with("2026-07-17")
+    szse.assert_called_once_with("2026-07-17")
+    breadth.assert_called_once_with()
+
+
+def test_update_market_daily_initial_partial_failures_store_null_groups(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    sse, _, _ = market_fetchers()
+    result = update_market_daily(
+        "2026-07-17",
+        database_path=database_path,
+        sse_fetcher=sse,
+        szse_fetcher=Mock(side_effect=RuntimeError("SZSE unavailable")),
+        breadth_fetcher=Mock(side_effect=RuntimeError("breadth unavailable")),
+    )
+    assert result.attempted_record.sh_amount_yuan is None
+    assert result.attempted_record.sz_amount_yuan is None
+    assert result.attempted_record.total_amount_yuan is None
+    assert result.attempted_record.advance_count is None
+    assert result.stored_record == result.attempted_record
+    assert len(result.errors) == 2
+    assert "Shenzhen amount fetch" in result.errors[0]
+    assert "Market breadth fetch" in result.errors[1]
+
+
+def test_update_market_daily_failed_amount_group_preserves_both_old_amounts(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    initial = compose_market_daily(
+        "2026-07-17",
+        sh_amount=ExchangeDailyAmount("2026-07-17", 100, SSE_AMOUNT_SOURCE),
+        sz_amount=ExchangeDailyAmount("2026-07-17", 200, SZSE_AMOUNT_SOURCE),
+        breadth=MarketBreadth(3000, 1800, 200),
+    )
+    save_market_daily(initial, database_path=database_path)
+    result = update_market_daily(
+        "2026-07-17",
+        database_path=database_path,
+        sse_fetcher=Mock(return_value=ExchangeDailyAmount("2026-07-17", 999, SSE_AMOUNT_SOURCE)),
+        szse_fetcher=Mock(side_effect=RuntimeError("failed")),
+        breadth_fetcher=Mock(return_value=MarketBreadth(3100, 1700, 200)),
+    )
+    assert result.attempted_record.total_amount_yuan is None
+    assert result.stored_record.sh_amount_yuan == 100
+    assert result.stored_record.sz_amount_yuan == 200
+    assert result.stored_record.total_amount_yuan == 300
+    assert result.stored_record.advance_count == 3100
+
+
+def test_update_market_daily_failed_breadth_preserves_old_breadth(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    sse, szse, breadth = market_fetchers()
+    first = update_market_daily(
+        "2026-07-17", database_path=database_path,
+        sse_fetcher=sse, szse_fetcher=szse, breadth_fetcher=breadth,
+    )
+    new_sse, new_szse, _ = market_fetchers(sh=400, sz=500)
+    second = update_market_daily(
+        "2026-07-17", database_path=database_path,
+        sse_fetcher=new_sse, szse_fetcher=new_szse,
+        breadth_fetcher=Mock(side_effect=RuntimeError("failed")),
+    )
+    assert second.attempted_record.advance_count is None
+    assert second.stored_record.total_amount_yuan == 900
+    assert second.stored_record.advance_count == first.stored_record.advance_count
+
+
+@pytest.mark.parametrize("bad_fetcher", [Mock(return_value=[]), Mock(return_value=None)])
+def test_update_market_daily_rejects_invalid_fetcher_values_as_group_failure(tmp_path: Path, bad_fetcher):
+    sse, _, breadth = market_fetchers()
+    result = update_market_daily(
+        "2026-07-17", database_path=tmp_path / "test.db",
+        sse_fetcher=sse, szse_fetcher=bad_fetcher, breadth_fetcher=breadth,
+    )
+    assert result.stored_record.total_amount_yuan is None
+    assert result.stored_record.advance_count == 3000
+    assert "ExchangeDailyAmount" in result.errors[0]
+
+
+def test_update_market_daily_save_failure_preserves_existing_data(tmp_path: Path, monkeypatch):
+    database_path = tmp_path / "test.db"
+    original = compose_market_daily(
+        "2026-07-17",
+        sh_amount=ExchangeDailyAmount("2026-07-17", 100, SSE_AMOUNT_SOURCE),
+        sz_amount=ExchangeDailyAmount("2026-07-17", 200, SZSE_AMOUNT_SOURCE),
+        breadth=MarketBreadth(3000, 1800, 200),
+    )
+    save_market_daily(original, database_path=database_path)
+    monkeypatch.setattr("src.data.update.save_market_daily", Mock(side_effect=RuntimeError("disk")))
+    sse, szse, breadth = market_fetchers(sh=999, sz=999)
+    with pytest.raises(RuntimeError, match=r"save failed.*2026-07-17"):
+        update_market_daily(
+            "2026-07-17", database_path=database_path,
+            sse_fetcher=sse, szse_fetcher=szse, breadth_fetcher=breadth,
+        )
+    assert get_market_daily("2026-07-17", database_path=database_path) == original

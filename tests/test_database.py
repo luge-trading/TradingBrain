@@ -7,6 +7,8 @@ import pandas as pd
 import pytest
 
 from src.data.database import (
+    get_latest_market_trade_date,
+    get_market_daily,
     get_latest_trade_date,
     init_database,
     load_daily_kline,
@@ -14,6 +16,15 @@ from src.data.database import (
     get_latest_index_trade_date,
     load_index_daily_kline,
     save_index_daily_kline,
+    load_market_daily,
+    save_market_daily,
+)
+from src.data.market import (
+    SSE_AMOUNT_SOURCE,
+    SZSE_AMOUNT_SOURCE,
+    ExchangeDailyAmount,
+    MarketBreadth,
+    compose_market_daily,
 )
 
 
@@ -290,3 +301,88 @@ def test_save_index_defensive_validation(tmp_path: Path, bad: pd.DataFrame):
         save_index_daily_kline("SH000001", bad, database_path=tmp_path / "test.db")
     with pytest.raises(ValueError, match="Unsupported index code"):
         save_index_daily_kline("SH999999", make_index_data(), database_path=tmp_path / "other.db")
+
+
+def make_market_record(trade_date="2026-07-17", sh=100, sz=200, breadth=(3000, 1800, 200)):
+    return compose_market_daily(
+        trade_date,
+        sh_amount=ExchangeDailyAmount(trade_date, sh, SSE_AMOUNT_SOURCE),
+        sz_amount=ExchangeDailyAmount(trade_date, sz, SZSE_AMOUNT_SOURCE),
+        breadth=MarketBreadth(*breadth),
+    )
+
+
+def test_market_database_schema_is_additive_and_exact(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_daily_kline("000021", make_kline_data(), database_path=database_path)
+    save_index_daily_kline("SH000001", make_index_data(), database_path=database_path)
+    init_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        columns = [(row[1], row[2], row[3], row[5]) for row in connection.execute("PRAGMA table_info(market_daily)")]
+    assert {"stock_daily", "index_daily", "market_daily"} <= tables
+    assert columns == [
+        ("trade_date", "TEXT", 0, 1),
+        ("sh_amount_yuan", "INTEGER", 0, 0),
+        ("sz_amount_yuan", "INTEGER", 0, 0),
+        ("total_amount_yuan", "INTEGER", 0, 0),
+        ("advance_count", "INTEGER", 0, 0),
+        ("decline_count", "INTEGER", 0, 0),
+        ("flat_count", "INTEGER", 0, 0),
+        ("sh_amount_source", "TEXT", 0, 0),
+        ("sz_amount_source", "TEXT", 0, 0),
+        ("breadth_source", "TEXT", 0, 0),
+        ("updated_at", "TEXT", 1, 0),
+    ]
+    assert len(load_daily_kline("000021", database_path=database_path)) == 2
+    assert len(load_index_daily_kline("SH000001", database_path=database_path)) == 2
+
+
+def test_market_database_insert_upsert_order_latest_and_derived_ratio(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_market_daily(make_market_record("2026-07-17"), database_path=database_path)
+    save_market_daily(make_market_record("2026-07-16", breadth=(1000, 900, 100)), database_path=database_path)
+    assert save_market_daily(make_market_record("2026-07-17", sh=400, sz=500), database_path=database_path) == 1
+    loaded = load_market_daily(database_path=database_path)
+    assert loaded["trade_date"].tolist() == ["2026-07-16", "2026-07-17"]
+    assert int(loaded.iloc[1]["total_amount_yuan"]) == 900
+    assert loaded.iloc[1]["advance_ratio"] == pytest.approx(0.6)
+    assert get_latest_market_trade_date(database_path=database_path) == "2026-07-17"
+    assert get_market_daily("2026-07-17", database_path=database_path) == make_market_record("2026-07-17", sh=400, sz=500)
+
+
+def test_market_database_preserves_null_as_sqlite_null(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_market_daily(compose_market_daily("2026-07-17"), database_path=database_path)
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT sh_amount_yuan, total_amount_yuan, advance_count FROM market_daily"
+        ).fetchone()
+    assert row == (None, None, None)
+    loaded = load_market_daily(database_path=database_path)
+    assert pd.isna(loaded.iloc[0]["sh_amount_yuan"])
+    assert pd.isna(loaded.iloc[0]["advance_ratio"])
+
+
+def test_market_database_failed_upsert_rolls_back_and_preserves_old_record(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    original = make_market_record("2026-07-17")
+    save_market_daily(original, database_path=database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("""CREATE TRIGGER reject_market_update BEFORE UPDATE ON market_daily
+            BEGIN SELECT RAISE(ABORT, 'blocked'); END;""")
+    with pytest.raises(RuntimeError, match="Unable to save market daily data"):
+        save_market_daily(make_market_record("2026-07-17", sh=999, sz=999), database_path=database_path)
+    assert get_market_daily("2026-07-17", database_path=database_path) == original
+
+
+def test_market_database_filters_dates_and_validates_inputs(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_market_daily(make_market_record("2026-07-16"), database_path=database_path)
+    save_market_daily(make_market_record("2026-07-17"), database_path=database_path)
+    loaded = load_market_daily(database_path=database_path, start_date="2026-07-17", end_date="2026-07-17")
+    assert loaded["trade_date"].tolist() == ["2026-07-17"]
+    with pytest.raises(ValueError, match="start_date"):
+        load_market_daily(database_path=database_path, start_date="2026-07-18", end_date="2026-07-17")
+    with pytest.raises(TypeError, match="MarketDaily"):
+        save_market_daily({"trade_date": "2026-07-17"}, database_path=database_path)
