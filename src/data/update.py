@@ -13,8 +13,12 @@ from src.data.database import (
     get_latest_trade_date,
     load_daily_kline,
     save_daily_kline,
+    get_latest_index_trade_date,
+    load_index_daily_kline,
+    save_index_daily_kline,
 )
-from src.data.providers.eastmoney import get_daily_kline
+from src.data.index import get_index_definition, normalize_index_daily_kline
+from src.data.providers.eastmoney import get_daily_kline, get_index_daily_kline
 
 
 KlineFetcher = Callable[..., pd.DataFrame]
@@ -25,6 +29,16 @@ class UpdateResult:
     """Result of one stock daily-data update."""
 
     symbol: str
+    fetched_rows: int
+    new_rows: int
+    stored_rows: int
+    latest_before: str | None
+    latest_after: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class IndexUpdateResult:
+    index_code: str
     fetched_rows: int
     new_rows: int
     stored_rows: int
@@ -114,3 +128,37 @@ def update_stock_daily(
         latest_before=latest_before,
         latest_after=latest_after,
     )
+
+
+def update_index_daily(
+    index_code: str,
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+    limit: int = 500,
+    fetcher: KlineFetcher = get_index_daily_kline,
+) -> IndexUpdateResult:
+    get_index_definition(index_code)
+    if not callable(fetcher):
+        raise TypeError("fetcher must be callable")
+    latest_before = get_latest_index_trade_date(index_code, database_path=database_path)
+    try:
+        fetched = fetcher(index_code, limit=limit)
+    except Exception as exc:
+        raise RuntimeError(f"Index update fetch failed for {index_code}: {exc}") from exc
+    if not isinstance(fetched, pd.DataFrame):
+        raise TypeError(f"Index update fetcher must return a DataFrame for {index_code}")
+    try:
+        normalized = normalize_index_daily_kline(fetched)
+    except Exception as exc:
+        raise ValueError(f"Index update normalization failed for {index_code}: {exc}") from exc
+    if normalized.empty:
+        return IndexUpdateResult(index_code, 0, 0, 0, latest_before, latest_before)
+    existing = load_index_daily_kline(index_code, database_path=database_path)
+    existing_dates = set(existing["date"].astype(str)) if not existing.empty else set()
+    new_rows = sum(date not in existing_dates for date in normalized["date"].astype(str))
+    try:
+        stored_rows = save_index_daily_kline(index_code, normalized, database_path=database_path)
+    except Exception as exc:
+        raise RuntimeError(f"Index update save failed for {index_code}: {exc}") from exc
+    latest_after = get_latest_index_trade_date(index_code, database_path=database_path)
+    return IndexUpdateResult(index_code, len(normalized), new_rows, stored_rows, latest_before, latest_after)

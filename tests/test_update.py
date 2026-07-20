@@ -7,7 +7,8 @@ import pandas as pd
 import pytest
 
 from src.data.database import load_daily_kline
-from src.data.update import UpdateResult, update_stock_daily
+from src.data.database import load_index_daily_kline, save_index_daily_kline
+from src.data.update import IndexUpdateResult, UpdateResult, update_index_daily, update_stock_daily
 
 
 def make_kline_data(dates: list[str]) -> pd.DataFrame:
@@ -252,3 +253,59 @@ def test_update_stock_daily_does_not_overwrite_existing_data_on_failure(
 
     stored = load_daily_kline("000021", database_path=database_path)
     assert stored["date"].tolist() == ["2026-07-16", "2026-07-17"]
+
+
+def index_data(close=11.0, dates=("2026-07-16", "2026-07-17")):
+    return pd.DataFrame([
+        {"date": date, "open": close - 1, "high": close + 1, "low": close - 2, "close": close, "volume": 100, "amount": 1000}
+        for date in dates
+    ])
+
+
+def test_update_index_upserts_all_rows_and_counts_only_new_dates(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    first = update_index_daily("SH000001", database_path=database_path, fetcher=Mock(return_value=index_data()))
+    assert isinstance(first, IndexUpdateResult)
+    assert (first.fetched_rows, first.new_rows, first.stored_rows) == (2, 2, 2)
+    revised = index_data(close=12.0, dates=("2026-07-16", "2026-07-17", "2026-07-18"))
+    second = update_index_daily("SH000001", database_path=database_path, fetcher=Mock(return_value=revised))
+    assert (second.fetched_rows, second.new_rows, second.stored_rows) == (3, 1, 3)
+    loaded = load_index_daily_kline("SH000001", database_path=database_path)
+    assert len(loaded) == 3
+    assert loaded.iloc[0]["close"] == 12.0
+
+
+def test_update_index_empty_and_failure_isolated(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    empty = update_index_daily("SH000001", database_path=database_path, fetcher=Mock(return_value=pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume", "amount"])))
+    assert (empty.fetched_rows, empty.new_rows, empty.stored_rows) == (0, 0, 0)
+    save_index_daily_kline("SZ399001", index_data(), database_path=database_path)
+    with pytest.raises(RuntimeError, match="SH000001"):
+        update_index_daily("SH000001", database_path=database_path, fetcher=Mock(side_effect=RuntimeError("network")))
+    assert len(load_index_daily_kline("SZ399001", database_path=database_path)) == 2
+
+
+def test_update_index_rejects_non_dataframe_and_preserves_data(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_index_daily_kline("SH000001", index_data(), database_path=database_path)
+    with pytest.raises(TypeError, match=r"DataFrame.*SH000001"):
+        update_index_daily("SH000001", database_path=database_path, fetcher=Mock(return_value=[]))
+    assert len(load_index_daily_kline("SH000001", database_path=database_path)) == 2
+
+
+def test_update_index_rejects_duplicate_dates_and_preserves_data(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_index_daily_kline("SH000001", index_data(), database_path=database_path)
+    duplicated = index_data(dates=("2026-07-16", "2026-07-16"))
+    with pytest.raises(ValueError, match=r"normalization.*SH000001"):
+        update_index_daily("SH000001", database_path=database_path, fetcher=Mock(return_value=duplicated))
+    assert len(load_index_daily_kline("SH000001", database_path=database_path)) == 2
+
+
+def test_update_index_save_failure_preserves_data(tmp_path: Path, monkeypatch):
+    database_path = tmp_path / "test.db"
+    save_index_daily_kline("SH000001", index_data(), database_path=database_path)
+    monkeypatch.setattr("src.data.update.save_index_daily_kline", Mock(side_effect=RuntimeError("disk")))
+    with pytest.raises(RuntimeError, match=r"save.*SH000001"):
+        update_index_daily("SH000001", database_path=database_path, fetcher=Mock(return_value=index_data(close=13.0)))
+    assert len(load_index_daily_kline("SH000001", database_path=database_path)) == 2

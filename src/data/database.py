@@ -10,6 +10,8 @@ from typing import Final
 
 import pandas as pd
 
+from src.data.index import INDEX_KLINE_COLUMNS, get_index_definition, normalize_index_daily_kline
+
 
 DEFAULT_DATABASE_PATH: Final[Path] = Path("data/trading_brain.db")
 
@@ -64,6 +66,38 @@ ON CONFLICT(symbol, trade_date) DO UPDATE SET
     updated_at = excluded.updated_at;
 """
 
+CREATE_INDEX_DAILY_TABLE_SQL: Final[str] = """
+CREATE TABLE IF NOT EXISTS index_daily (
+    index_code TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    open REAL NOT NULL,
+    high REAL NOT NULL,
+    low REAL NOT NULL,
+    close REAL NOT NULL,
+    volume INTEGER NOT NULL,
+    amount REAL NULL,
+    source TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (index_code, trade_date)
+);
+"""
+
+UPSERT_INDEX_DAILY_SQL: Final[str] = """
+INSERT INTO index_daily (
+    index_code, trade_date, open, high, low, close, volume, amount, source, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(index_code, trade_date) DO UPDATE SET
+    open = excluded.open,
+    high = excluded.high,
+    low = excluded.low,
+    close = excluded.close,
+    volume = excluded.volume,
+    amount = excluded.amount,
+    source = excluded.source,
+    updated_at = excluded.updated_at;
+"""
+
 
 def _validate_symbol(symbol: str) -> None:
     """Validate a six-digit stock code."""
@@ -93,6 +127,7 @@ def init_database(
     try:
         with sqlite3.connect(path) as connection:
             connection.execute(CREATE_STOCK_DAILY_TABLE_SQL)
+            connection.execute(CREATE_INDEX_DAILY_TABLE_SQL)
     except sqlite3.Error as exc:
         raise RuntimeError("Unable to initialize database") from exc
 
@@ -254,3 +289,76 @@ def get_latest_trade_date(
         return None
 
     return str(row[0])
+
+
+def save_index_daily_kline(
+    index_code: str,
+    data: pd.DataFrame,
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+    source: str = "eastmoney",
+) -> int:
+    get_index_definition(index_code)
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("source must be a non-empty string")
+    normalized = normalize_index_daily_kline(data)
+    if normalized.empty:
+        return 0
+    updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    records = []
+    for row in normalized.itertuples(index=False, name=None):
+        trade_date, open_price, high_price, low_price, close_price, volume, amount = row
+        records.append((
+            index_code, trade_date, float(open_price), float(high_price),
+            float(low_price), float(close_price), int(volume),
+            None if pd.isna(amount) else float(amount), source.strip(), updated_at,
+        ))
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            connection.executemany(UPSERT_INDEX_DAILY_SQL, records)
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"Unable to save index K-line data for {index_code}") from exc
+    return len(records)
+
+
+def load_index_daily_kline(
+    index_code: str,
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+) -> pd.DataFrame:
+    get_index_definition(index_code)
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    query = """
+    SELECT trade_date AS date, open, high, low, close, volume, amount
+    FROM index_daily WHERE index_code = ? ORDER BY trade_date ASC;
+    """
+    try:
+        with sqlite3.connect(path) as connection:
+            result = pd.read_sql_query(query, connection, params=(index_code,))
+    except (sqlite3.Error, pd.errors.DatabaseError) as exc:
+        raise RuntimeError(f"Unable to load index K-line data for {index_code}") from exc
+    if not result.empty:
+        result["volume"] = result["volume"].astype("int64")
+    return result.loc[:, list(INDEX_KLINE_COLUMNS)]
+
+
+def get_latest_index_trade_date(
+    index_code: str,
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+) -> str | None:
+    get_index_definition(index_code)
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            row = connection.execute(
+                "SELECT MAX(trade_date) FROM index_daily WHERE index_code = ?",
+                (index_code,),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"Unable to query latest index trade date for {index_code}") from exc
+    return None if row is None or row[0] is None else str(row[0])

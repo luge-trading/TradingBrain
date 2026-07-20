@@ -6,10 +6,12 @@ import pandas as pd
 import pytest
 
 from src.analysis.technical import (
+    analyze_index_daily,
     analyze_stock_daily,
     calculate_technical_indicators,
 )
 from src.data.database import save_daily_kline
+from src.data.database import save_index_daily_kline
 
 
 def make_indicator_data(
@@ -224,3 +226,19 @@ def test_analyze_stock_daily_rejects_missing_data(
             "000021",
             database_path=database_path,
         )
+
+
+def test_analyze_index_daily_reuses_indicators_and_accepts_null_amount(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    data = make_database_data()
+    data["amount"] = pd.Series([None] * len(data), dtype="object")
+    save_index_daily_kline("SH000001", data, database_path=database_path)
+    result = analyze_index_daily("SH000001", database_path=database_path)
+    assert len(result) == 20
+    assert "ma20" in result.columns
+    assert result["amount"].isna().all()
+
+
+def test_analyze_index_daily_rejects_missing_data(tmp_path: Path):
+    with pytest.raises(ValueError, match="No stored daily K-line data for index"):
+        analyze_index_daily("SH000001", database_path=tmp_path / "test.db")

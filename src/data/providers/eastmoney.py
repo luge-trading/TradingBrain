@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import logging
 import time
 
 import pandas as pd
+import numpy as np
 import requests
+
+from src.data.index import (
+    INDEX_KLINE_COLUMNS,
+    get_index_definition,
+    normalize_index_daily_kline,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -240,3 +248,90 @@ def get_daily_kline(
         raise RuntimeError("EastMoney returned no K-line records")
 
     return _parse_kline_records(klines)
+
+
+def _raise_index_fetch_error(index_code: str, attempt: int, exc: BaseException) -> None:
+    raise RuntimeError(
+        f"Unable to retrieve eastmoney index K-line data for {index_code} "
+        f"after {attempt} attempts: {exc}"
+    ) from exc
+
+
+def get_index_daily_kline(
+    index_code: str,
+    *,
+    limit: int = 100,
+    retries: int = DEFAULT_EASTMONEY_RETRIES,
+    backoff_base: float = DEFAULT_BACKOFF_BASE,
+    sleep: Callable[[float], None] = time.sleep,
+) -> pd.DataFrame:
+    """Return validated daily K-lines for one of the supported indexes."""
+    definition = get_index_definition(index_code)
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        raise ValueError(f"Invalid K-line limit: {limit!r}")
+    if not isinstance(retries, int) or isinstance(retries, bool) or retries <= 0:
+        raise ValueError(f"Invalid retries: {retries!r}")
+    if not isinstance(backoff_base, (int, float)) or isinstance(backoff_base, bool) or not np.isfinite(backoff_base) or backoff_base < 0:
+        raise ValueError(f"Invalid backoff_base: {backoff_base!r}")
+
+    params = {
+        "secid": definition.eastmoney_secid,
+        "klt": "101", "fqt": "1", "lmt": str(limit), "end": "20500101",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+    }
+    attempt = 0
+    response = None
+    last_exc: BaseException | None = None
+    while attempt < retries:
+        attempt += 1
+        try:
+            response = _fetch_once(index_code, params)
+            break
+        except requests.HTTPError as exc:
+            response = getattr(exc, "response", None)
+            if _should_retry_request(exc, response=response) and attempt < retries:
+                _sleep_backoff(attempt, backoff_base, sleep)
+                last_exc = exc
+                continue
+            _raise_index_fetch_error(index_code, attempt, exc)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            if attempt < retries:
+                _sleep_backoff(attempt, backoff_base, sleep)
+                last_exc = exc
+                continue
+            _raise_index_fetch_error(index_code, attempt, exc)
+        except requests.RequestException as exc:
+            _raise_index_fetch_error(index_code, attempt, exc)
+
+    if response is None:
+        _raise_index_fetch_error(index_code, attempt, last_exc or RuntimeError("unknown error"))
+    try:
+        result = response.json()
+        if not isinstance(result, dict) or result.get("rc") != 0:
+            raise ValueError("invalid response")
+        data = result.get("data")
+        if not isinstance(data, dict) or "klines" not in data:
+            raise ValueError("missing data.klines")
+        klines = data["klines"]
+        if not isinstance(klines, list):
+            raise ValueError("data.klines is not a list")
+        if not klines:
+            return pd.DataFrame(columns=list(INDEX_KLINE_COLUMNS))
+        records = []
+        for item in klines:
+            if not isinstance(item, str):
+                raise ValueError("K-line record is not a string")
+            fields = item.split(",")
+            if len(fields) < 7:
+                raise ValueError("K-line record has insufficient fields")
+            records.append({
+                "date": fields[0], "open": fields[1], "high": fields[3],
+                "low": fields[4], "close": fields[2], "volume": fields[5],
+                "amount": fields[6],
+            })
+        return normalize_index_daily_kline(pd.DataFrame(records, columns=INDEX_KLINE_COLUMNS))
+    except Exception as exc:
+        if isinstance(exc, RuntimeError) and str(exc).startswith("Unable to retrieve"):
+            raise
+        _raise_index_fetch_error(index_code, attempt, exc)

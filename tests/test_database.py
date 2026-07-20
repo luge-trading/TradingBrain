@@ -11,6 +11,9 @@ from src.data.database import (
     init_database,
     load_daily_kline,
     save_daily_kline,
+    get_latest_index_trade_date,
+    load_index_daily_kline,
+    save_index_daily_kline,
 )
 
 
@@ -239,3 +242,51 @@ def test_database_rejects_invalid_symbol(
             symbol,  # type: ignore[arg-type]
             database_path=database_path,
         )
+
+
+def make_index_data(amount=None):
+    return pd.DataFrame([
+        {"date": "2026-07-17", "open": 10, "high": 12, "low": 9, "close": 11, "volume": 100, "amount": amount},
+        {"date": "2026-07-16", "open": 9, "high": 10, "low": 8, "close": 9.5, "volume": 90, "amount": 900},
+    ])
+
+
+def test_index_database_schema_and_stock_isolation(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_daily_kline("000021", make_kline_data(), database_path=database_path)
+    assert save_index_daily_kline("SH000001", make_index_data(), database_path=database_path) == 2
+    with sqlite3.connect(database_path) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        columns = {row[1]: row[3] for row in connection.execute("PRAGMA table_info(index_daily)")}
+    assert {"stock_daily", "index_daily"} <= tables
+    assert columns["amount"] == 0
+
+
+def test_index_database_upsert_null_amount_and_order(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_index_daily_kline("SH000001", make_index_data(amount="--"), database_path=database_path)
+    updated = make_index_data(amount=1234).iloc[[0]].copy()
+    save_index_daily_kline("SH000001", updated, database_path=database_path)
+    loaded = load_index_daily_kline("SH000001", database_path=database_path)
+    assert loaded["date"].tolist() == ["2026-07-16", "2026-07-17"]
+    assert loaded.iloc[1]["amount"] == 1234
+    assert get_latest_index_trade_date("SH000001", database_path=database_path) == "2026-07-17"
+
+
+def test_index_save_rolls_back_entire_batch_on_trigger_failure(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    init_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("""CREATE TRIGGER reject_second BEFORE INSERT ON index_daily
+            WHEN NEW.trade_date = '2026-07-17' BEGIN SELECT RAISE(ABORT, 'blocked'); END;""")
+    with pytest.raises(RuntimeError, match="Unable to save index K-line data"):
+        save_index_daily_kline("SH000001", make_index_data(), database_path=database_path)
+    assert load_index_daily_kline("SH000001", database_path=database_path).empty
+
+
+@pytest.mark.parametrize("bad", [pd.DataFrame([{"date": "2026-07-17"}]), pd.DataFrame([{"date": "2026-07-17", "open": 1, "high": 2, "low": 0, "close": 1, "volume": -1, "amount": 1}])])
+def test_save_index_defensive_validation(tmp_path: Path, bad: pd.DataFrame):
+    with pytest.raises((ValueError, TypeError)):
+        save_index_daily_kline("SH000001", bad, database_path=tmp_path / "test.db")
+    with pytest.raises(ValueError, match="Unsupported index code"):
+        save_index_daily_kline("SH999999", make_index_data(), database_path=tmp_path / "other.db")

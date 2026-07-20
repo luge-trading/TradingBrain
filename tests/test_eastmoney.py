@@ -8,6 +8,7 @@ import requests
 
 from src.data.providers.eastmoney import (
     EASTMONEY_KLINE_URL,
+    get_index_daily_kline,
     get_daily_kline,
 )
 
@@ -80,6 +81,99 @@ def test_get_daily_kline_returns_standard_dataframe(
         headers={"User-Agent": "Mozilla/5.0"},
         timeout=10,
     )
+
+
+@patch("src.data.providers.eastmoney.requests.get")
+def test_get_index_daily_kline_maps_secids_and_fields(mock_get: Mock):
+    mock_get.return_value = make_response({"rc": 0, "data": {"klines": ["2026-07-16,10,11,12,9,100,1000"]}})
+    result = get_index_daily_kline("SH000001")
+    assert result.columns.tolist() == ["date", "open", "high", "low", "close", "volume", "amount"]
+    assert result.iloc[0]["close"] == 11.0
+    assert mock_get.call_args.kwargs["params"]["secid"] == "1.000001"
+
+
+@patch("src.data.providers.eastmoney.requests.get")
+def test_get_index_daily_kline_accepts_empty_klines(mock_get: Mock):
+    mock_get.return_value = make_response({"rc": 0, "data": {"klines": []}})
+    result = get_index_daily_kline("SZ399001")
+    assert result.empty
+    assert result.columns.tolist() == ["date", "open", "high", "low", "close", "volume", "amount"]
+
+
+@patch("src.data.providers.eastmoney.requests.get")
+def test_get_index_daily_kline_error_contains_code_source_and_attempts(mock_get: Mock):
+    mock_get.side_effect = [requests.Timeout("timeout")] * 3
+    with pytest.raises(RuntimeError, match=r"eastmoney.*SH000001.*3 attempts"):
+        get_index_daily_kline("SH000001", sleep=Mock())
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+def test_index_provider_retries_retryable_http(status: int):
+    response = Mock(status_code=status)
+    response.raise_for_status.side_effect = requests.HTTPError(response=response)
+    mock_get = Mock(side_effect=[response, response, response])
+    sleep = Mock()
+    with patch("src.data.providers.eastmoney.requests.get", mock_get):
+        with pytest.raises(RuntimeError, match=rf"SH000001.*after 3 attempts"):
+            get_index_daily_kline("SH000001", sleep=sleep)
+    assert mock_get.call_count == 3
+    assert sleep.call_args_list == [call(0.5), call(1.0)]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+def test_index_provider_does_not_retry_non_retryable_http(status: int):
+    response = Mock(status_code=status)
+    response.raise_for_status.side_effect = requests.HTTPError(response=response)
+    mock_get = Mock(return_value=response)
+    sleep = Mock()
+    with patch("src.data.providers.eastmoney.requests.get", mock_get):
+        with pytest.raises(RuntimeError, match=r"SH000001.*after 1 attempts"):
+            get_index_daily_kline("SH000001", sleep=sleep)
+    assert mock_get.call_count == 1
+    sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [requests.Timeout("timeout"), requests.ConnectionError("connection")])
+def test_index_provider_retries_network_errors(error):
+    mock_get = Mock(side_effect=[error, make_response({"rc": 0, "data": {"klines": ["2026-07-16,10,11,12,9,100,1000"]}})])
+    sleep = Mock()
+    with patch("src.data.providers.eastmoney.requests.get", mock_get):
+        result = get_index_daily_kline("SH000001", sleep=sleep)
+    assert len(result) == 1
+    assert mock_get.call_count == 2
+    sleep.assert_called_once_with(0.5)
+
+
+@pytest.mark.parametrize("payload", [ValueError("bad json"), {"rc": 0}, {"rc": 0, "data": {"klines": "bad"}}, {"rc": 0, "data": {"klines": [123]}}, {"rc": 0, "data": {"klines": ["2026-07-16,10"]}}])
+def test_index_provider_rejects_malformed_responses(payload):
+    response = make_response({})
+    if isinstance(payload, Exception):
+        response.json.side_effect = payload
+    else:
+        response.json.return_value = payload
+    mock_get = Mock(return_value=response)
+    with patch("src.data.providers.eastmoney.requests.get", mock_get):
+        with pytest.raises(RuntimeError, match=r"eastmoney.*SH000001.*after 1 attempts"):
+            get_index_daily_kline("SH000001", sleep=Mock())
+    assert mock_get.call_count == 1
+
+
+@pytest.mark.parametrize("kline", [
+    "bad-date,10,11,12,9,100,1000",
+    "2026-07-16,10,11,9,12,100,1000",
+    "2026-07-16,10,11,12,9,1.5,1000",
+    "2026-07-16,10,11,12,9,-1,1000",
+    "2026-07-16,10,11,12,9,100,-1",
+    "2026-07-16,10,11,12,9,100,NaN",
+    "2026-07-16,10,11,12,9,100,1000",
+])
+def test_index_provider_normalizer_validation(kline: str):
+    klines = [kline, kline] if kline.startswith("2026-07-16") and kline.endswith(",1000") else [kline]
+    response = make_response({"rc": 0, "data": {"klines": klines}})
+    with patch("src.data.providers.eastmoney.requests.get", return_value=response) as mock_get:
+        with pytest.raises(RuntimeError, match=r"SH000001.*after 1 attempts"):
+            get_index_daily_kline("SH000001", sleep=Mock())
+    mock_get.assert_called_once()
 
 
 @patch("src.data.providers.eastmoney.requests.get")

@@ -10,7 +10,9 @@ import pandas as pd
 from src.data.database import (
     DEFAULT_DATABASE_PATH,
     load_daily_kline,
+    load_index_daily_kline,
 )
+from src.data.index import get_index_definition
 
 
 REQUIRED_COLUMNS = (
@@ -177,4 +179,16 @@ def analyze_stock_daily(
             f"No stored daily K-line data for stock: {symbol}"
         )
 
+    return calculate_technical_indicators(stored_data)
+
+
+def analyze_index_daily(
+    index_code: str,
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+) -> pd.DataFrame:
+    get_index_definition(index_code)
+    stored_data = load_index_daily_kline(index_code, database_path=database_path)
+    if stored_data.empty:
+        raise ValueError(f"No stored daily K-line data for index: {index_code}")
     return calculate_technical_indicators(stored_data)

@@ -64,8 +64,17 @@ EastMoney 行情
 - TASK-011B：完成 EastMoney 有限重试和失败保护。
 - TASK-011C：完成 macOS 用户级 LaunchAgent、每天 15:30 调度和管理脚本。
 - TASK-011D：完成 Gmail SMTP_SSL 邮件通知、Keychain 凭据、certifi CA、失败隔离、LaunchAgent 邮件参数和真实通道验证。
+- TASK-012A：实现并验证四个核心指数的日线基础设施；最终提交哈希以当前 `HEAD` 为准，尚未在本文中预填。
 
-TASK-012 尚未开始。市场指数、市场宽度、行业/概念板块及个股板块联动尚未进入生产实现。
+TASK-012A 已完成：支持 `SH000001`（上证指数，`1.000001`）、`SZ399001`（深证成指，`0.399001`）、`SZ399006`（创业板指，`0.399006`）和 `SH000688`（科创50，`1.000688`）。已实现指数日K获取、严格标准化、独立 SQLite 保存/读取/latest、单指数增量更新及现有技术指标包装。尚未实现市场宽度、行业/概念板块、个股-板块联动、市场环境报告、daily summary、邮件或 LaunchAgent 集成。
+
+`index_daily` 使用独立表，业务主键为 `(index_code, trade_date)`，字段包含 OHLC、volume、nullable amount、source 和 updated_at。`save_index_daily_kline()` 使用幂等 upsert；`update_index_daily()` 对本次所有有效记录 upsert，`new_rows` 仅统计新增交易日，因此可接收数据源对历史记录的修订。`analyze_index_daily()` 仅复用已有技术指标计算，不新增预测或确定性交易信号。
+
+volume 与 amount 目前只定义为 EastMoney provider-native 数值。真实响应没有提供权威单位元数据；无证据表明具体单位，后续报告不得擅自标为“股、手、元”等。amount 可缺失，数据库保存为 SQLite `NULL`，不得伪造为 0。
+
+`get_index_daily_kline()` 和 `update_index_daily()` 不自行判断是否收盘。收盘前调用可能获得当日尚未最终形成的日K。正式自动复盘的最终性依赖现有 `scheduled_review` 交易日/收盘门控；TASK-012A 尚未接入该调度链路。后续 TASK-012E 接入市场环境报告时，必须保持该门控，或显式标记为盘中预览。
+
+TASK-012A 离线全量测试通过；随后完成四个指数各一次请求、`limit=5`、`retries=1` 的受控真实 provider 探针，均成功，并通过临时 SQLite 往返和指标包装验证。探针未写入 `data/trading_brain.db`，未进入 engine、邮件或 LaunchAgent。四个样本的 amount 均非缺失，但不代表所有历史或未来响应都不会缺失。
 
 ## 6. 自动化运行链路
 
@@ -157,4 +166,4 @@ git diff --check
 
 ## 12. 当前下一步
 
-下一阶段是 TASK-012：市场和板块环境分析。必须先确认总体路线，再一次只设计和实施一个子任务。当前首个候选是 TASK-012A“核心指数数据”；在 TASK-012A 设计、数据口径、schema 和验收标准获得确认前，不开始编码。
+下一阶段是 TASK-012B“两市成交额与市场宽度”，先完成设计与口径确认，再开始编码。
