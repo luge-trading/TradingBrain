@@ -1,6 +1,6 @@
 """Tests for the EastMoney market data provider."""
 
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pandas as pd
 import pytest
@@ -151,6 +151,231 @@ def test_get_daily_kline_converts_network_error(
         match="Unable to retrieve EastMoney K-line data",
     ):
         get_daily_kline("000021")
+
+
+@patch("src.data.providers.eastmoney.requests.get")
+def test_get_daily_kline_retries_timeout_then_success(
+    mock_get: Mock,
+) -> None:
+    response = make_response(
+        {
+            "rc": 0,
+            "data": {
+                "klines": [
+                    "2026-07-16,10,11,12,9,100,1000"
+                ]
+            },
+        }
+    )
+    mock_get.side_effect = [requests.Timeout("timeout"), response]
+    sleep = Mock()
+
+    result = get_daily_kline("000021", sleep=sleep)
+
+    assert isinstance(result, pd.DataFrame)
+    assert mock_get.call_count == 2
+    sleep.assert_called_once_with(0.5)
+
+
+@patch("src.data.providers.eastmoney.requests.get")
+def test_get_daily_kline_retries_http_429_then_success(
+    mock_get: Mock,
+) -> None:
+    retry_response = Mock(status_code=429)
+    retry_response.raise_for_status.side_effect = requests.HTTPError(
+        "429 Too Many Requests",
+        response=retry_response,
+    )
+    success_response = make_response(
+        {
+            "rc": 0,
+            "data": {
+                "klines": [
+                    "2026-07-16,10,11,12,9,100,1000"
+                ]
+            },
+        }
+    )
+
+    mock_get.side_effect = [retry_response, success_response]
+    sleep = Mock()
+
+    result = get_daily_kline("000021", sleep=sleep)
+
+    assert isinstance(result, pd.DataFrame)
+    assert mock_get.call_count == 2
+    sleep.assert_called_once_with(0.5)
+
+
+@patch("src.data.providers.eastmoney.requests.get")
+def test_get_daily_kline_exhausts_connection_errors(
+    mock_get: Mock,
+) -> None:
+    mock_get.side_effect = [
+        requests.ConnectionError("conn1"),
+        requests.ConnectionError("conn2"),
+        requests.ConnectionError("conn3"),
+    ]
+    sleep = Mock()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Unable to retrieve EastMoney K-line data",
+    ):
+        get_daily_kline("000021", sleep=sleep)
+
+    assert mock_get.call_count == 3
+    assert sleep.call_count == 2
+    sleep.assert_has_calls([call(0.5), call(1.0)])
+
+
+@patch("src.data.providers.eastmoney.requests.get")
+def test_get_daily_kline_does_not_retry_http_400(
+    mock_get: Mock,
+) -> None:
+    response = Mock(status_code=400)
+    response.raise_for_status.side_effect = requests.HTTPError(
+        "400 Bad Request",
+        response=response,
+    )
+    mock_get.return_value = response
+    sleep = Mock()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Unable to retrieve EastMoney K-line data",
+    ):
+        get_daily_kline("000021", sleep=sleep)
+
+    assert mock_get.call_count == 1
+    sleep.assert_not_called()
+
+
+@patch("src.data.providers.eastmoney.requests.get")
+def test_get_daily_kline_does_not_retry_invalid_json(
+    mock_get: Mock,
+) -> None:
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.side_effect = ValueError("invalid JSON")
+    mock_get.return_value = response
+    sleep = Mock()
+
+    with pytest.raises(
+        RuntimeError,
+        match="EastMoney returned invalid JSON",
+    ):
+        get_daily_kline("000021", sleep=sleep)
+
+    assert mock_get.call_count == 1
+    sleep.assert_not_called()
+
+
+@patch("src.data.providers.eastmoney.requests.get")
+def test_get_daily_kline_retries_http_5xx_then_success(
+    mock_get: Mock,
+) -> None:
+    retry_response = Mock(status_code=502)
+    retry_response.raise_for_status.side_effect = requests.HTTPError(
+        "502 Bad Gateway",
+        response=retry_response,
+    )
+    success_response = make_response(
+        {
+            "rc": 0,
+            "data": {
+                "klines": [
+                    "2026-07-16,10,11,12,9,100,1000"
+                ]
+            },
+        }
+    )
+
+    mock_get.side_effect = [retry_response, success_response]
+    sleep = Mock()
+
+    result = get_daily_kline("000021", sleep=sleep)
+
+    assert isinstance(result, pd.DataFrame)
+    assert mock_get.call_count == 2
+    sleep.assert_called_once_with(0.5)
+
+
+@pytest.mark.parametrize("status_code", [429, 500, 502, 503, 504])
+@patch("src.data.providers.eastmoney.requests.get")
+def test_get_daily_kline_retries_retryable_http_statuses(
+    mock_get: Mock,
+    status_code: int,
+) -> None:
+    retry_response = Mock(status_code=status_code)
+    retry_response.raise_for_status.side_effect = requests.HTTPError(
+        f"{status_code} error",
+        response=retry_response,
+    )
+    success_response = make_response(
+        {
+            "rc": 0,
+            "data": {
+                "klines": [
+                    "2026-07-16,10,11,12,9,100,1000"
+                ]
+            },
+        }
+    )
+
+    mock_get.side_effect = [retry_response, success_response]
+    sleep = Mock()
+
+    result = get_daily_kline("000021", sleep=sleep)
+
+    assert isinstance(result, pd.DataFrame)
+    assert mock_get.call_count == 2
+    sleep.assert_called_once_with(0.5)
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404])
+@patch("src.data.providers.eastmoney.requests.get")
+def test_get_daily_kline_does_not_retry_non_retryable_http_statuses(
+    mock_get: Mock,
+    status_code: int,
+) -> None:
+    response = Mock(status_code=status_code)
+    response.raise_for_status.side_effect = requests.HTTPError(
+        f"{status_code} error",
+        response=response,
+    )
+    mock_get.return_value = response
+    sleep = Mock()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Unable to retrieve EastMoney K-line data",
+    ):
+        get_daily_kline("000021", sleep=sleep)
+
+    assert mock_get.call_count == 1
+    sleep.assert_not_called()
+
+
+@patch("src.data.providers.eastmoney.requests.get")
+def test_get_daily_kline_final_exception_includes_symbol_and_attempts(
+    mock_get: Mock,
+) -> None:
+    mock_get.side_effect = [
+        requests.Timeout("timeout1"),
+        requests.Timeout("timeout2"),
+        requests.Timeout("timeout3"),
+    ]
+    sleep = Mock()
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"000021 after 3 attempts: .*timeout3",
+    ):
+        get_daily_kline("000021", sleep=sleep)
+
+    assert mock_get.call_count == 3
+    sleep.assert_has_calls([call(0.5), call(1.0)])
 
 
 @patch("src.data.providers.eastmoney.requests.get")

@@ -229,3 +229,26 @@ def test_update_stock_daily_rejects_missing_date_column(
             database_path=database_path,
             fetcher=Mock(return_value=invalid_data),
         )
+
+
+def test_update_stock_daily_does_not_overwrite_existing_data_on_failure(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "test.db"
+    from src.data.database import save_daily_kline, load_daily_kline
+
+    initial = make_kline_data(["2026-07-16", "2026-07-17"])
+    save_daily_kline("000021", initial, database_path=database_path)
+
+    def failing_fetcher(symbol, *, limit):
+        raise RuntimeError("fetch failed")
+
+    with pytest.raises(RuntimeError, match="fetch failed"):
+        update_stock_daily(
+            "000021",
+            database_path=database_path,
+            fetcher=failing_fetcher,
+        )
+
+    stored = load_daily_kline("000021", database_path=database_path)
+    assert stored["date"].tolist() == ["2026-07-16", "2026-07-17"]

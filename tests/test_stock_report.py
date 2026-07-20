@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest import mock
 
 import pandas as pd
+import pytest
 
 from src.report import generate_stock_report
 from src.data.update import UpdateResult
@@ -47,6 +48,18 @@ def test_generate_report_update_called(tmp_path, monkeypatch):
     content = path.read_text(encoding="utf-8")
     assert "一、数据更新" in content
     assert "最新行情" in content or "二、最新行情" in content
+
+
+def test_generate_report_update_failure_does_not_create_report(tmp_path):
+    symbol = "000021"
+    db = tmp_path / "data.db"
+    output = tmp_path / "000021-review.md"
+
+    with mock.patch("src.report.stock_report.update_stock_daily", side_effect=RuntimeError("update failed")):
+        with pytest.raises(RuntimeError, match="update failed"):
+            generate_stock_report(symbol, database_path=str(db), output_dir=tmp_path, update_data=True, limit=500)
+
+    assert not output.exists()
 
 
 def test_generate_report_no_update(tmp_path):

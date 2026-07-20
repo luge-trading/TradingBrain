@@ -4,13 +4,21 @@ from __future__ import annotations
 
 from typing import Any
 
+import logging
+import time
+
 import pandas as pd
 import requests
 
+logger = logging.getLogger(__name__)
 
 EASTMONEY_KLINE_URL = (
     "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 )
+
+DEFAULT_EASTMONEY_RETRIES = 3
+DEFAULT_BACKOFF_BASE = 0.5
+RETRYABLE_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
 
 KLINE_COLUMNS = [
     "date",
@@ -74,10 +82,52 @@ def _parse_kline_records(klines: list[Any]) -> pd.DataFrame:
     return pd.DataFrame(records, columns=KLINE_COLUMNS)
 
 
+def _should_retry_request(exc: BaseException, response: requests.Response | None = None) -> bool:
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+
+    if response is not None:
+        status = response.status_code
+        return status in RETRYABLE_HTTP_STATUS_CODES
+
+    return False
+
+
+def _sleep_backoff(attempt: int, base_delay: float, sleep_func: callable) -> None:
+    delay = base_delay * (2 ** (attempt - 1))
+    logger.debug(
+        "EastMoney retry sleep: attempt=%s delay=%s", attempt, delay
+    )
+    sleep_func(delay)
+
+
+def _fetch_once(
+    symbol: str,
+    params: dict[str, str],
+) -> requests.Response:
+    response = requests.get(
+        EASTMONEY_KLINE_URL,
+        params=params,
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    return response
+
+
+def _raise_fetch_error(symbol: str, attempt: int, exc: BaseException) -> None:
+    raise RuntimeError(
+        f"Unable to retrieve EastMoney K-line data for {symbol} after {attempt} attempts: {exc}"
+    ) from exc
+
+
 def get_daily_kline(
     symbol: str,
     *,
     limit: int = 100,
+    retries: int = DEFAULT_EASTMONEY_RETRIES,
+    backoff_base: float = DEFAULT_BACKOFF_BASE,
+    sleep: callable = time.sleep,
 ) -> pd.DataFrame:
     """Return recent daily K-line data for an A-share stock.
 
@@ -101,6 +151,20 @@ def get_daily_kline(
     ):
         raise ValueError(f"Invalid K-line limit: {limit!r}")
 
+    if (
+        not isinstance(retries, int)
+        or isinstance(retries, bool)
+        or retries <= 0
+    ):
+        raise ValueError(f"Invalid retries: {retries!r}")
+
+    if (
+        not isinstance(backoff_base, (int, float))
+        or isinstance(backoff_base, bool)
+        or backoff_base < 0
+    ):
+        raise ValueError(f"Invalid backoff_base: {backoff_base!r}")
+
     params = {
         "secid": f"{market}.{symbol}",
         "klt": "101",
@@ -114,22 +178,46 @@ def get_daily_kline(
         ),
     }
 
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-    }
+    attempt = 0
+    response = None
+    last_exc: BaseException | None = None
+    while attempt < retries:
+        attempt += 1
+        try:
+            response = _fetch_once(symbol, params)
+            break
+        except requests.HTTPError as exc:
+            response = getattr(exc, "response", None)
+            if _should_retry_request(exc, response=response) and attempt < retries:
+                logger.warning(
+                    "EastMoney request retrying %s/%s for %s due to HTTP %s",
+                    attempt,
+                    retries,
+                    symbol,
+                    response.status_code if response is not None else "unknown",
+                )
+                _sleep_backoff(attempt, backoff_base, sleep)
+                last_exc = exc
+                continue
+            _raise_fetch_error(symbol, attempt, exc)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            if attempt < retries:
+                logger.warning(
+                    "EastMoney request retrying %s/%s for %s due to %s",
+                    attempt,
+                    retries,
+                    symbol,
+                    type(exc).__name__,
+                )
+                _sleep_backoff(attempt, backoff_base, sleep)
+                last_exc = exc
+                continue
+            _raise_fetch_error(symbol, attempt, exc)
+        except requests.RequestException as exc:
+            _raise_fetch_error(symbol, attempt, exc)
 
-    try:
-        response = requests.get(
-            EASTMONEY_KLINE_URL,
-            params=params,
-            headers=headers,
-            timeout=10,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            "Unable to retrieve EastMoney K-line data"
-        ) from exc
+    if response is None:
+        _raise_fetch_error(symbol, attempt, last_exc or RuntimeError("unknown error"))
 
     try:
         result = response.json()
