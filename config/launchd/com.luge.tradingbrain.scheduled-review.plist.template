@@ -17,6 +17,8 @@
         <string>__PROJECT_ROOT__/reports</string>
         <string>--log-path</string>
         <string>__PROJECT_ROOT__/logs/scheduled-review.jsonl</string>
+        <string>--email-config</string>
+        <string>__PROJECT_ROOT__/config/email.toml</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__PROJECT_ROOT__</string>

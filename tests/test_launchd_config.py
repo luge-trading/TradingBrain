@@ -1,6 +1,9 @@
 import plistlib
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 
 
@@ -40,6 +43,7 @@ def test_program_arguments_are_exact_and_ordered():
         "--database-path", f"{root}/data/trading_brain.db",
         "--output-dir", f"{root}/reports",
         "--log-path", f"{root}/logs/scheduled-review.jsonl",
+        "--email-config", f"{root}/config/email.toml",
     ]
 
 
@@ -49,7 +53,7 @@ def test_rendered_runtime_paths_are_absolute():
         data["WorkingDirectory"], data["StandardOutPath"], data["StandardErrorPath"]
     ]
     runtime_paths = [value for value in paths if value.startswith(str(PROJECT_ROOT))]
-    assert len(runtime_paths) == 8
+    assert len(runtime_paths) == 9
     assert all(Path(value).is_absolute() for value in runtime_paths)
 
 
@@ -104,3 +108,122 @@ def test_management_script_supports_required_commands_without_forbidden_privileg
     for command in ("validate", "install", "uninstall", "reload", "status", "run"):
         assert f"{command})" in text
     assert "sudo" not in text
+
+
+def test_email_config_is_absolute_and_plist_has_no_sensitive_fields():
+    data = render_template()
+    arguments = data["ProgramArguments"]
+    index = arguments.index("--email-config")
+    assert arguments[index + 1] == str(PROJECT_ROOT / "config/email.toml")
+    serialized = TEMPLATE.read_text(encoding="utf-8").lower()
+    assert all(word not in serialized for word in ("password", "secret", "token"))
+
+
+def test_management_script_validates_email_config_semantically():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert 'config/email.toml' in text
+    assert 'tomllib.load' in text
+
+
+def make_isolated_script_project(tmp_path):
+    project = tmp_path / "project"
+    script_dir = project / "scripts"
+    template_dir = project / "config/launchd"
+    python_dir = project / ".venv/bin"
+    fake_bin = tmp_path / "fake-bin"
+    temp_dir = tmp_path / "temporary-files"
+    home = tmp_path / "home"
+    for directory in (script_dir, template_dir, python_dir, fake_bin, temp_dir, home):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    shutil.copy2(SCRIPT, script_dir / SCRIPT.name)
+    shutil.copy2(TEMPLATE, template_dir / TEMPLATE.name)
+    (project / "config/watchlist.toml").write_text('symbols = ["600000"]\n', encoding="utf-8")
+    (project / "config/email.toml").write_text(
+        '''version = 1
+enabled = true
+[smtp]
+host = "smtp.example.com"
+port = 465
+timeout_seconds = 5
+[message]
+sender = "sender@example.com"
+recipients = ["recipient@example.com"]
+subject_prefix = "[TradingBrain]"
+attach_summary = false
+[keychain]
+service = "com.example.smtp"
+''', encoding="utf-8",
+    )
+    python_wrapper = python_dir / "python"
+    python_wrapper.write_text(
+        "#!/bin/bash\n"
+        f"exec {shlex.quote(sys.executable)} \"$@\"\n",
+        encoding="utf-8",
+    )
+    python_wrapper.chmod(0o755)
+
+    state = tmp_path / "launchctl-state"
+    launchctl = fake_bin / "launchctl"
+    launchctl.write_text(
+        f'''#!/bin/bash
+set -euo pipefail
+state={state!s}
+case "$1" in
+    print) [[ -e "$state" ]] ;;
+    bootstrap) touch "$state" ;;
+    bootout) rm -f "$state" ;;
+    kickstart) [[ -e "$state" ]] ;;
+    *) exit 2 ;;
+esac
+''', encoding="utf-8",
+    )
+    launchctl.chmod(0o755)
+    environment = {
+        "HOME": str(home),
+        "TMPDIR": str(temp_dir) + "/",
+        "PATH": str(fake_bin) + ":/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONPATH": str(PROJECT_ROOT),
+    }
+    return project, environment, state, temp_dir
+
+
+def run_isolated_command(project, environment, command):
+    return subprocess.run(
+        [str(project / "scripts/manage_launchd.sh"), command],
+        cwd=PROJECT_ROOT, env=environment, capture_output=True, text=True, check=False,
+    )
+
+
+def test_validate_succeeds_and_removes_temporary_plist(tmp_path):
+    project, environment, _, temp_dir = make_isolated_script_project(tmp_path)
+    result = run_isolated_command(project, environment, "validate")
+    assert result.returncode == 0, result.stderr
+    assert list(temp_dir.iterdir()) == []
+
+
+def test_install_succeeds_and_removes_temporary_plist(tmp_path):
+    project, environment, state, temp_dir = make_isolated_script_project(tmp_path)
+    result = run_isolated_command(project, environment, "install")
+    assert result.returncode == 0, result.stderr
+    assert state.exists()
+    assert list(temp_dir.iterdir()) == []
+
+
+def test_reload_clears_return_trap_before_outer_function_returns(tmp_path):
+    project, environment, state, temp_dir = make_isolated_script_project(tmp_path)
+    state.touch()
+    result = run_isolated_command(project, environment, "reload")
+    assert result.returncode == 0, result.stderr
+    assert "unbound variable" not in result.stderr
+    assert state.exists()
+    assert list(temp_dir.iterdir()) == []
+
+
+def test_render_failure_still_removes_temporary_plist(tmp_path):
+    project, environment, _, temp_dir = make_isolated_script_project(tmp_path)
+    template = project / "config/launchd" / TEMPLATE.name
+    template.write_text("not a plist with __PROJECT_ROOT__", encoding="utf-8")
+    result = run_isolated_command(project, environment, "validate")
+    assert result.returncode != 0
+    assert list(temp_dir.iterdir()) == []

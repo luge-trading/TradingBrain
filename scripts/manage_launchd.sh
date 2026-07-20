@@ -38,16 +38,33 @@ check_prerequisites() {
     [[ -f "$TEMPLATE" ]] || { echo "$prefix missing template: $TEMPLATE" >&2; return 1; }
     [[ -x "$PROJECT_ROOT/.venv/bin/python" ]] || { echo "$prefix Python is not executable: $PROJECT_ROOT/.venv/bin/python" >&2; return 1; }
     [[ -f "$PROJECT_ROOT/config/watchlist.toml" ]] || { echo "$prefix missing watchlist: $PROJECT_ROOT/config/watchlist.toml" >&2; return 1; }
+    [[ -f "$PROJECT_ROOT/config/email.toml" ]] || { echo "$prefix missing email config: $PROJECT_ROOT/config/email.toml" >&2; return 1; }
+    "$PROJECT_ROOT/.venv/bin/python" - "$PROJECT_ROOT/config/email.toml" <<'PY'
+from pathlib import Path
+import sys
+import tomllib
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8").lower()
+for forbidden in ("password", "app_password", "token", "secret", "credential"):
+    if forbidden in text:
+        raise SystemExit(f"email config contains forbidden field: {forbidden}")
+with path.open("rb") as stream:
+    data = tomllib.load(stream)
+print(f"Email sender: {data['message']['sender']}")
+print(f"Email recipients: {', '.join(data['message']['recipients'])}")
+print(f"SMTP: {data['smtp']['host']}:{data['smtp']['port']}")
+PY
     "$PROJECT_ROOT/.venv/bin/python" -W error -m src.engine.scheduled_review --help >/dev/null
 }
 
-validate() {
+validate() (
     local prefix="[validate]"
     local temporary_plist
     echo "$prefix checking prerequisites"
     check_prerequisites "$prefix"
     temporary_plist="$(mktemp "${TMPDIR:-/tmp}/tradingbrain-launchd.XXXXXX")"
-    trap 'rm -f "$temporary_plist"' RETURN
+    trap 'rm -f "$temporary_plist"' EXIT
     render_plist "$temporary_plist"
     plutil -lint "$temporary_plist"
     echo "$prefix project root: $PROJECT_ROOT"
@@ -56,18 +73,19 @@ validate() {
     echo "$prefix database: $PROJECT_ROOT/data/trading_brain.db"
     echo "$prefix reports: $PROJECT_ROOT/reports"
     echo "$prefix JSONL log: $PROJECT_ROOT/logs/scheduled-review.jsonl"
+    echo "$prefix email config: $PROJECT_ROOT/config/email.toml"
     echo "$prefix schedule: daily at 15:30 system local time"
     echo "$prefix validation passed"
-}
+)
 
-install_service() {
+install_service() (
     local prefix="${1:-[install]}"
     local temporary_plist
     echo "$prefix checking prerequisites"
     check_prerequisites "$prefix"
     mkdir -p "$HOME/Library/LaunchAgents" "$PROJECT_ROOT/logs" "$PROJECT_ROOT/reports" "$PROJECT_ROOT/data"
     temporary_plist="$(mktemp "${TMPDIR:-/tmp}/tradingbrain-launchd.XXXXXX")"
-    trap 'rm -f "$temporary_plist"' RETURN
+    trap 'rm -f "$temporary_plist"' EXIT
     render_plist "$temporary_plist"
     plutil -lint "$temporary_plist"
     safe_bootout "$prefix"
@@ -77,7 +95,7 @@ install_service() {
     launchctl bootstrap "$DOMAIN" "$DESTINATION"
     launchctl print "$SERVICE_TARGET"
     echo "$prefix installed: $DESTINATION"
-}
+)
 
 uninstall_service() {
     local prefix="[uninstall]"

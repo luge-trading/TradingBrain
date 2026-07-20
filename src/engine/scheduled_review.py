@@ -39,6 +39,37 @@ def _write_log(path: Path, record: dict) -> None:
         fh.write(text + "\n")
 
 
+def _send_email_notification(args: argparse.Namespace, result: ScheduledRunResult, details: dict | None = None) -> None:
+    if result.status not in {"completed", "completed_with_errors", "failed"}:
+        return
+    if bool(getattr(args, "no_email", False)):
+        print("Email notification skipped: --no-email")
+        return
+    config_path = Path(getattr(args, "email_config", "config/email.toml"))
+    if not config_path.is_file():
+        print(f"Email notification skipped: config not found: {config_path}")
+        return
+    try:
+        from src.notification.email_sender import send_review_email
+
+        payload = details or {}
+        notification = send_review_email(
+            config_path,
+            market_date=result.market_date,
+            status=result.status,
+            started_at=result.started_at,
+            finished_at=result.finished_at,
+            details=payload,
+            summary_path=payload.get("summary_path"),
+        )
+        if notification.sent:
+            print("Email notification sent")
+        else:
+            print(f"Email notification skipped: {notification.error or 'disabled'}")
+    except Exception as exc:
+        print(f"Email notification failed: {exc}", file=sys.stderr)
+
+
 def run_scheduled_review(args: argparse.Namespace, *, now: Optional[datetime] = None) -> ScheduledRunResult:
     # import calendar helpers here so tests can monkeypatch calendar module
     from src.market.calendar import (
@@ -80,7 +111,9 @@ def run_scheduled_review(args: argparse.Namespace, *, now: Optional[datetime] = 
             print(f"Error writing log: {err}", file=sys.stderr)
             return ScheduledRunResult(market_date, started_at, finished_at, "failed", 1, forced, log_path, message=message)
         print(f"Error: {message}", file=sys.stderr)
-        return ScheduledRunResult(market_date, started_at, finished_at, "failed", 1, forced, log_path, message=message)
+        result = ScheduledRunResult(market_date, started_at, finished_at, "failed", 1, forced, log_path, message=message)
+        _send_email_notification(args, result)
+        return result
 
     # Non-trading day
     if not trading and not forced:
@@ -121,7 +154,9 @@ def run_scheduled_review(args: argparse.Namespace, *, now: Optional[datetime] = 
         except Exception:
             pass
         print(f"Error: {message}", file=sys.stderr)
-        return ScheduledRunResult(market_date, started_at, finished_at, "failed", 1, forced, log_path, message=message)
+        result = ScheduledRunResult(market_date, started_at, finished_at, "failed", 1, forced, log_path, message=message)
+        _send_email_notification(args, result)
+        return result
 
     now_dt = (now or get_market_now()).astimezone(MARKET_TIMEZONE)
     if close_dt is not None and now_dt < close_dt and not forced:
@@ -157,13 +192,19 @@ def run_scheduled_review(args: argparse.Namespace, *, now: Optional[datetime] = 
     }
     _write_log(log_path, record)
     print(f"运行日志: {log_path}")
-    return ScheduledRunResult(market_date, started_at, finished_at, status, exit_code, forced, log_path)
+    summary_path = Path(getattr(args, "output_dir", "reports")) / f"{market_date.isoformat()}-daily-summary.md"
+    execution_details = {"summary_path": summary_path}
+    result = ScheduledRunResult(market_date, started_at, finished_at, status, exit_code, forced, log_path)
+    _send_email_notification(args, result, execution_details)
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     parser.add_argument("--force", dest="force", action="store_true", help="Force execution regardless of trading day or close time")
     parser.add_argument("--log-path", dest="log_path", default="logs/scheduled-review.jsonl", help="Path to append run logs (JSONL)")
+    parser.add_argument("--email-config", default="config/email.toml", help="Path to email notification TOML config")
+    parser.add_argument("--no-email", action="store_true", help="Disable email notification for this run")
     args = parser.parse_args(argv)
 
     try:

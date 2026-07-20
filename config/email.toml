@@ -1,0 +1,16 @@
+version = 1
+enabled = true
+
+[smtp]
+host = "smtp.gmail.com"
+port = 465
+timeout_seconds = 20
+
+[message]
+sender = "louislu0008@gmail.com"
+recipients = ["louislu0008@gmail.com"]
+subject_prefix = "[TradingBrain]"
+attach_summary = true
+
+[keychain]
+service = "com.luge.tradingbrain.smtp"
