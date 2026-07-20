@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.luge.tradingbrain.scheduled-review</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_ROOT__/.venv/bin/python</string>
+        <string>-m</string>
+        <string>src.engine.scheduled_review</string>
+        <string>--watchlist</string>
+        <string>__PROJECT_ROOT__/config/watchlist.toml</string>
+        <string>--database-path</string>
+        <string>__PROJECT_ROOT__/data/trading_brain.db</string>
+        <string>--output-dir</string>
+        <string>__PROJECT_ROOT__/reports</string>
+        <string>--log-path</string>
+        <string>__PROJECT_ROOT__/logs/scheduled-review.jsonl</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_ROOT__</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>15</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__PROJECT_ROOT__/logs/launchd-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_ROOT__/logs/launchd-stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>
