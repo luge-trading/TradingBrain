@@ -99,13 +99,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    update_data = not bool(args.no_update)
+    return execute_daily_review(args)
 
-    if args.symbols is not None:
+
+def execute_daily_review(args: argparse.Namespace) -> int:
+    """Coordinate execution of a daily review run using parsed CLI args.
+
+    This function is a pure coordinator wrapper around existing logic in
+    `main` and is intended to be called by other CLIs (e.g. scheduled_review)
+    without duplicating argument parsing.
+    """
+    update_data = not bool(getattr(args, "no_update", False))
+
+    if getattr(args, "symbols", None) is not None:
         symbols = normalize_symbols(args.symbols)
         source = "命令行"
     else:
-        watchlist_path = Path(args.watchlist) if args.watchlist else DEFAULT_WATCHLIST_PATH
+        watchlist_path = Path(getattr(args, "watchlist", None)) if getattr(args, "watchlist", None) else DEFAULT_WATCHLIST_PATH
         try:
             config = load_watchlist(watchlist_path)
         except Exception as exc:
@@ -121,10 +131,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = run_daily_review(
             symbols,
-            database_path=args.database_path,
-            output_dir=args.output_dir,
+            database_path=getattr(args, "database_path", None),
+            output_dir=getattr(args, "output_dir", None),
             update_data=update_data,
-            limit=args.limit,
+            limit=getattr(args, "limit", 500),
         )
     except SystemExit:
         raise
@@ -149,8 +159,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         summary_path = generate_daily_summary(
             result,
-            database_path=args.database_path,
-            output_dir=args.output_dir,
+            database_path=getattr(args, "database_path", None),
+            output_dir=getattr(args, "output_dir", None),
             watchlist_source=source,
             summary_meta=summary_meta,
         )
