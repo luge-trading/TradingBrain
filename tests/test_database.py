@@ -2,11 +2,13 @@
 
 import sqlite3
 from pathlib import Path
+from unittest.mock import Mock
 
 import pandas as pd
 import pytest
 
 from src.data.database import (
+    SECTOR_DAILY_PANEL_COLUMNS,
     get_latest_sector_trade_date,
     get_latest_market_trade_date,
     get_market_daily,
@@ -24,6 +26,7 @@ from src.data.database import (
     load_sector_registry,
     save_sector_daily_kline,
     save_sector_registry_snapshot,
+    load_sector_daily_panel,
 )
 from src.data.market import (
     SSE_AMOUNT_SOURCE,
@@ -526,3 +529,110 @@ def test_sector_daily_batch_failure_rolls_back_all_rows(tmp_path: Path):
     with pytest.raises(RuntimeError, match="Unable to save sector daily data"):
         save_sector_daily_kline(current, sector_kline(), database_path=database_path)
     assert load_sector_daily_kline(current, database_path=database_path).empty
+
+
+def _save_panel_fixture(database_path: Path):
+    definitions = [
+        sector_definition(1, "BK0001", "Level One"),
+        sector_definition(2, "BK0002", "Level Two"),
+        sector_definition(3, "BK0003", "Level Three"),
+    ]
+    save_sector_registry_snapshot(definitions, database_path=database_path)
+    for position, definition in enumerate(definitions):
+        data = sector_kline().copy()
+        data.loc[data["date"] == "2026-07-18", "volume"] = None
+        data.loc[data["date"] == "2026-07-18", "amount"] = None
+        data.loc[data["date"] == "2026-07-18", "change_pct"] = None
+        data["close"] = data["close"] + position
+        data["high"] = data["high"] + position
+        save_sector_daily_kline(definition, data, database_path=database_path)
+    return definitions
+
+
+def test_load_sector_daily_panel_returns_fixed_columns_types_sort_and_nulls(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    _save_panel_fixture(database_path)
+    result = load_sector_daily_panel(database_path=database_path)
+    assert result.columns.tolist() == list(SECTOR_DAILY_PANEL_COLUMNS)
+    assert list(zip(result["sector_level"], result["sector_code"], result["date"])) == sorted(
+        zip(result["sector_level"], result["sector_code"], result["date"])
+    )
+    assert str(result["sector_level"].dtype) == "int64"
+    assert result["is_active"].dtype == bool
+    assert str(result["volume"].dtype) == "Int64"
+    missing = result[result["date"] == "2026-07-18"]
+    assert missing["volume"].isna().all()
+    assert missing["amount"].isna().all()
+    assert missing["change_pct"].isna().all()
+    assert not (missing[["amount", "change_pct"]] == 0).any().any()
+
+
+@pytest.mark.parametrize("level", [1, 2, 3])
+def test_load_sector_daily_panel_filters_each_level_and_date_range(tmp_path: Path, level: int):
+    database_path = tmp_path / "test.db"
+    _save_panel_fixture(database_path)
+    result = load_sector_daily_panel(
+        database_path=database_path,
+        sector_level=level,
+        start_date="2026-07-18",
+        end_date="2026-07-18",
+    )
+    assert result["sector_level"].tolist() == [level]
+    assert result["date"].tolist() == ["2026-07-18"]
+
+
+def test_load_sector_daily_panel_active_filter_current_name_and_inactive_history(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    definitions = _save_panel_fixture(database_path)
+    renamed = sector_definition(2, "BK0002", "Current Name")
+    save_sector_registry_snapshot([renamed, definitions[2]], database_path=database_path)
+    active = load_sector_daily_panel(database_path=database_path)
+    assert set(active["sector_code"]) == {"BK0002", "BK0003"}
+    assert active.loc[active["sector_code"] == "BK0002", "sector_name"].unique().tolist() == ["Current Name"]
+    all_rows = load_sector_daily_panel(database_path=database_path, active_only=False)
+    old = all_rows[all_rows["sector_code"] == "BK0001"]
+    assert len(old) == 2
+    assert old["is_active"].tolist() == [False, False]
+
+
+def test_load_sector_daily_panel_joins_on_complete_business_key(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    definition = sector_definition(1, "BK0001")
+    save_sector_registry_snapshot([definition], database_path=database_path)
+    save_sector_daily_kline(definition, sector_kline().iloc[[0]], database_path=database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """INSERT INTO sector_daily (
+                sector_type, sector_level, sector_code, trade_date,
+                open, high, low, close, volume, amount, change_pct, source, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (EASTMONEY_INDUSTRY_SECTOR_TYPE, 2, "BK0001", "2026-07-19", 1, 2, 0.5, 1.5, 1, 2, 3, "test", "2026-07-19T00:00:00+00:00"),
+        )
+    result = load_sector_daily_panel(database_path=database_path, active_only=False)
+    assert result[["sector_level", "sector_code", "date"]].to_dict("records") == [
+        {"sector_level": 1, "sector_code": "BK0001", "date": "2026-07-18"}
+    ]
+
+
+def test_load_sector_daily_panel_empty_structure_and_parameter_validation(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    empty = load_sector_daily_panel(database_path=database_path, sector_level=None)
+    assert empty.empty
+    assert empty.columns.tolist() == list(SECTOR_DAILY_PANEL_COLUMNS)
+    assert str(empty["sector_level"].dtype) == "int64"
+    assert empty["is_active"].dtype == bool
+    assert str(empty["volume"].dtype) == "Int64"
+    with pytest.raises(TypeError, match="active_only"):
+        load_sector_daily_panel(database_path=database_path, active_only=1)
+    with pytest.raises(ValueError, match="start_date"):
+        load_sector_daily_panel(database_path=database_path, start_date="2026-07-19", end_date="2026-07-18")
+    with pytest.raises(ValueError):
+        load_sector_daily_panel(database_path=database_path, sector_level=4)
+
+
+def test_load_sector_daily_panel_wraps_initialization_runtime_error(tmp_path: Path, monkeypatch):
+    original = RuntimeError("initialization failed")
+    monkeypatch.setattr("src.data.database.init_database", Mock(side_effect=original))
+    with pytest.raises(RuntimeError, match="^Unable to load sector daily panel$") as captured:
+        load_sector_daily_panel(database_path=tmp_path / "test.db")
+    assert captured.value.__cause__ is original

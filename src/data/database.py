@@ -37,6 +37,22 @@ KLINE_COLUMNS: Final[tuple[str, ...]] = (
     "amount",
 )
 
+SECTOR_DAILY_PANEL_COLUMNS: Final[tuple[str, ...]] = (
+    "sector_type",
+    "sector_level",
+    "sector_code",
+    "sector_name",
+    "is_active",
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount",
+    "change_pct",
+)
+
 CREATE_STOCK_DAILY_TABLE_SQL: Final[str] = """
 CREATE TABLE IF NOT EXISTS stock_daily (
     symbol TEXT NOT NULL,
@@ -838,3 +854,80 @@ def get_latest_sector_trade_date(
     except sqlite3.Error as exc:
         raise RuntimeError(f"Unable to query latest sector trade date for {definition.sector_code}") from exc
     return None if row is None or row[0] is None else str(row[0])
+
+
+def load_sector_daily_panel(
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+    sector_level: int | None = None,
+    active_only: bool = True,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    """Load joined industry registry and daily facts without deriving metrics."""
+    if sector_level is not None:
+        sector_level = validate_sector_level(sector_level)
+    if not isinstance(active_only, bool):
+        raise TypeError("active_only must be a bool")
+    if start_date is not None:
+        start_date = validate_trade_date(start_date)
+    if end_date is not None:
+        end_date = validate_trade_date(end_date)
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
+
+    conditions = ["registry.sector_type = ?"]
+    params: list[object] = [EASTMONEY_INDUSTRY_SECTOR_TYPE]
+    if sector_level is not None:
+        conditions.append("registry.sector_level = ?")
+        params.append(sector_level)
+    if active_only:
+        conditions.append("registry.is_active = 1")
+    if start_date is not None:
+        conditions.append("daily.trade_date >= ?")
+        params.append(start_date)
+    if end_date is not None:
+        conditions.append("daily.trade_date <= ?")
+        params.append(end_date)
+
+    query = f"""
+    SELECT
+        registry.sector_type,
+        registry.sector_level,
+        registry.sector_code,
+        registry.sector_name,
+        registry.is_active,
+        daily.trade_date AS date,
+        daily.open,
+        daily.high,
+        daily.low,
+        daily.close,
+        daily.volume,
+        daily.amount,
+        daily.change_pct
+    FROM sector_daily AS daily
+    INNER JOIN sector_registry AS registry
+        ON daily.sector_type = registry.sector_type
+       AND daily.sector_level = registry.sector_level
+       AND daily.sector_code = registry.sector_code
+    WHERE {' AND '.join(conditions)}
+    ORDER BY registry.sector_level ASC, registry.sector_code ASC, daily.trade_date ASC;
+    """
+    path = _prepare_database_path(database_path)
+    try:
+        init_database(path)
+    except RuntimeError as exc:
+        raise RuntimeError("Unable to load sector daily panel") from exc
+    try:
+        with sqlite3.connect(path) as connection:
+            result = pd.read_sql_query(query, connection, params=params)
+    except (sqlite3.Error, pd.errors.DatabaseError) as exc:
+        raise RuntimeError("Unable to load sector daily panel") from exc
+
+    result = result.loc[:, list(SECTOR_DAILY_PANEL_COLUMNS)]
+    result["sector_level"] = result["sector_level"].astype("int64")
+    result["is_active"] = result["is_active"].astype(bool)
+    result["volume"] = result["volume"].astype("Int64")
+    for column in ("open", "high", "low", "close", "amount", "change_pct"):
+        result[column] = result[column].astype("float64")
+    return result
