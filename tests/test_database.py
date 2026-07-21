@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from src.data.database import (
+    get_latest_sector_trade_date,
     get_latest_market_trade_date,
     get_market_daily,
     get_latest_trade_date,
@@ -18,6 +19,11 @@ from src.data.database import (
     save_index_daily_kline,
     load_market_daily,
     save_market_daily,
+    get_sector_definition,
+    load_sector_daily_kline,
+    load_sector_registry,
+    save_sector_daily_kline,
+    save_sector_registry_snapshot,
 )
 from src.data.market import (
     SSE_AMOUNT_SOURCE,
@@ -25,6 +31,11 @@ from src.data.market import (
     ExchangeDailyAmount,
     MarketBreadth,
     compose_market_daily,
+)
+from src.data.sector import (
+    EASTMONEY_INDUSTRY_REGISTRY_SOURCE,
+    EASTMONEY_INDUSTRY_SECTOR_TYPE,
+    SectorDefinition,
 )
 
 
@@ -386,3 +397,132 @@ def test_market_database_filters_dates_and_validates_inputs(tmp_path: Path):
         load_market_daily(database_path=database_path, start_date="2026-07-18", end_date="2026-07-17")
     with pytest.raises(TypeError, match="MarketDaily"):
         save_market_daily({"trade_date": "2026-07-17"}, database_path=database_path)
+
+
+def sector_definition(level=1, code="BK0001", name="Industry"):
+    return SectorDefinition(
+        EASTMONEY_INDUSTRY_SECTOR_TYPE,
+        level,
+        code,
+        name,
+        EASTMONEY_INDUSTRY_REGISTRY_SOURCE,
+    )
+
+
+def sector_kline():
+    return pd.DataFrame([
+        {"date": "2026-07-18", "open": 10, "high": 12, "low": 9, "close": 11, "volume": None, "amount": "--", "change_pct": pd.NA},
+        {"date": "2026-07-17", "open": 9, "high": 10, "low": 8, "close": 9.5, "volume": 90, "amount": 900, "change_pct": -1.0},
+    ])
+
+
+def test_sector_tables_are_additive_with_exact_schema_and_preserve_existing_data(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_daily_kline("000021", make_kline_data(), database_path=database_path)
+    save_index_daily_kline("SH000001", make_index_data(), database_path=database_path)
+    save_market_daily(make_market_record(), database_path=database_path)
+    init_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        registry = [(row[1], row[2], row[3], row[5]) for row in connection.execute("PRAGMA table_info(sector_registry)")]
+        daily = [(row[1], row[2], row[3], row[5]) for row in connection.execute("PRAGMA table_info(sector_daily)")]
+    assert {"stock_daily", "index_daily", "market_daily", "sector_registry", "sector_daily"} <= tables
+    assert registry == [
+        ("sector_type", "TEXT", 1, 1), ("sector_level", "INTEGER", 1, 2),
+        ("sector_code", "TEXT", 1, 3), ("sector_name", "TEXT", 1, 0),
+        ("source", "TEXT", 1, 0), ("is_active", "INTEGER", 1, 0),
+        ("updated_at", "TEXT", 1, 0),
+    ]
+    assert daily == [
+        ("sector_type", "TEXT", 1, 1), ("sector_level", "INTEGER", 1, 2),
+        ("sector_code", "TEXT", 1, 3), ("trade_date", "TEXT", 1, 4),
+        ("open", "REAL", 1, 0), ("high", "REAL", 1, 0),
+        ("low", "REAL", 1, 0), ("close", "REAL", 1, 0),
+        ("volume", "INTEGER", 0, 0), ("amount", "REAL", 0, 0),
+        ("change_pct", "REAL", 0, 0), ("source", "TEXT", 1, 0),
+        ("updated_at", "TEXT", 1, 0),
+    ]
+    assert len(load_daily_kline("000021", database_path=database_path)) == 2
+    assert len(load_index_daily_kline("SH000001", database_path=database_path)) == 2
+    assert get_market_daily("2026-07-17", database_path=database_path) is not None
+
+
+def test_sector_registry_snapshot_upserts_name_marks_inactive_and_filters(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    first = [sector_definition(2, "BK0002", "Old"), sector_definition(1, "BK0001", "One")]
+    assert save_sector_registry_snapshot(first, database_path=database_path) == 2
+    assert save_sector_registry_snapshot([sector_definition(2, "BK0002", "New")], database_path=database_path) == 1
+    active = load_sector_registry(database_path=database_path)
+    assert active[["sector_code", "sector_name", "is_active"]].to_dict("records") == [
+        {"sector_code": "BK0002", "sector_name": "New", "is_active": True}
+    ]
+    all_rows = load_sector_registry(database_path=database_path, active_only=False)
+    assert all_rows["sector_code"].tolist() == ["BK0001", "BK0002"]
+    assert all_rows["is_active"].tolist() == [False, True]
+    assert load_sector_registry(database_path=database_path, sector_level=1, active_only=False)["sector_code"].tolist() == ["BK0001"]
+    assert get_sector_definition(EASTMONEY_INDUSTRY_SECTOR_TYPE, 2, "BK0002", database_path=database_path).sector_name == "New"
+    assert get_sector_definition(EASTMONEY_INDUSTRY_SECTOR_TYPE, 1, "BK0001", database_path=database_path) is None
+    assert get_sector_definition(EASTMONEY_INDUSTRY_SECTOR_TYPE, 1, "BK0001", database_path=database_path, active_only=False).sector_name == "One"
+
+
+def test_sector_registry_snapshot_failure_rolls_back_active_state(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    original = [sector_definition(1, "BK0001"), sector_definition(2, "BK0002")]
+    save_sector_registry_snapshot(original, database_path=database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("""CREATE TRIGGER reject_registry_insert BEFORE INSERT ON sector_registry
+            WHEN NEW.sector_code = 'BK0003' BEGIN SELECT RAISE(ABORT, 'blocked'); END;""")
+    with pytest.raises(RuntimeError, match="Unable to save sector registry snapshot"):
+        save_sector_registry_snapshot([sector_definition(3, "BK0003")], database_path=database_path)
+    assert load_sector_registry(database_path=database_path)["sector_code"].tolist() == ["BK0001", "BK0002"]
+
+
+def test_sector_daily_requires_active_matching_definition_and_upserts_revision(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    current = sector_definition()
+    with pytest.raises(ValueError, match="not active"):
+        save_sector_daily_kline(current, sector_kline(), database_path=database_path)
+    save_sector_registry_snapshot([current], database_path=database_path)
+    assert save_sector_daily_kline(current, sector_kline(), database_path=database_path) == 2
+    revised = sector_kline().iloc[[0]].copy()
+    revised.loc[:, "close"] = 11.5
+    save_sector_daily_kline(current, revised, database_path=database_path)
+    loaded = load_sector_daily_kline(current, database_path=database_path)
+    assert loaded["date"].tolist() == ["2026-07-17", "2026-07-18"]
+    assert loaded.iloc[1]["close"] == 11.5
+    assert str(loaded["volume"].dtype) == "Int64"
+    assert pd.isna(loaded.iloc[1]["volume"])
+    assert pd.isna(loaded.iloc[1]["amount"])
+    assert pd.isna(loaded.iloc[1]["change_pct"])
+    assert get_latest_sector_trade_date(current, database_path=database_path) == "2026-07-18"
+    with pytest.raises(ValueError, match="name"):
+        save_sector_daily_kline(sector_definition(name="Renamed"), sector_kline(), database_path=database_path)
+    wrong_source = SectorDefinition(EASTMONEY_INDUSTRY_SECTOR_TYPE, 1, "BK0001", "Industry", "other")
+    with pytest.raises(ValueError, match="source"):
+        save_sector_daily_kline(wrong_source, sector_kline(), database_path=database_path)
+
+
+def test_sector_daily_rejects_inactive_save_but_allows_historical_read_and_filters(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    old = sector_definition(1, "BK0001")
+    save_sector_registry_snapshot([old], database_path=database_path)
+    save_sector_daily_kline(old, sector_kline(), database_path=database_path)
+    save_sector_registry_snapshot([sector_definition(2, "BK0002")], database_path=database_path)
+    with pytest.raises(ValueError, match="not active"):
+        save_sector_daily_kline(old, sector_kline(), database_path=database_path)
+    loaded = load_sector_daily_kline(old, database_path=database_path, start_date="2026-07-18", end_date="2026-07-18")
+    assert loaded["date"].tolist() == ["2026-07-18"]
+    with pytest.raises(ValueError, match="start_date"):
+        load_sector_daily_kline(old, database_path=database_path, start_date="2026-07-19", end_date="2026-07-18")
+
+
+def test_sector_daily_batch_failure_rolls_back_all_rows(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    current = sector_definition()
+    save_sector_registry_snapshot([current], database_path=database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("""CREATE TRIGGER reject_sector_second BEFORE INSERT ON sector_daily
+            WHEN NEW.trade_date = '2026-07-18' BEGIN SELECT RAISE(ABORT, 'blocked'); END;""")
+    with pytest.raises(RuntimeError, match="Unable to save sector daily data"):
+        save_sector_daily_kline(current, sector_kline(), database_path=database_path)
+    assert load_sector_daily_kline(current, database_path=database_path).empty

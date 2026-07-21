@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 import sqlite3
 from datetime import datetime, timezone
 from os import PathLike
@@ -12,6 +13,16 @@ import pandas as pd
 
 from src.data.index import INDEX_KLINE_COLUMNS, get_index_definition, normalize_index_daily_kline
 from src.data.market import MarketDaily, calculate_advance_ratio, validate_trade_date
+from src.data.sector import (
+    EASTMONEY_INDUSTRY_KLINE_SOURCE,
+    EASTMONEY_INDUSTRY_SECTOR_TYPE,
+    SECTOR_KLINE_COLUMNS,
+    SectorDefinition,
+    normalize_sector_daily_kline,
+    normalize_sector_registry,
+    validate_sector_code,
+    validate_sector_level,
+)
 
 
 DEFAULT_DATABASE_PATH: Final[Path] = Path("data/trading_brain.db")
@@ -135,6 +146,80 @@ ON CONFLICT(trade_date) DO UPDATE SET
     updated_at = excluded.updated_at;
 """
 
+CREATE_SECTOR_REGISTRY_TABLE_SQL: Final[str] = """
+CREATE TABLE IF NOT EXISTS sector_registry (
+    sector_type TEXT NOT NULL,
+    sector_level INTEGER NOT NULL
+        CHECK (sector_level IN (1, 2, 3)),
+    sector_code TEXT NOT NULL,
+    sector_name TEXT NOT NULL,
+    source TEXT NOT NULL,
+    is_active INTEGER NOT NULL
+        CHECK (is_active IN (0, 1)),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (
+        sector_type,
+        sector_level,
+        sector_code
+    )
+);
+"""
+
+CREATE_SECTOR_DAILY_TABLE_SQL: Final[str] = """
+CREATE TABLE IF NOT EXISTS sector_daily (
+    sector_type TEXT NOT NULL,
+    sector_level INTEGER NOT NULL
+        CHECK (sector_level IN (1, 2, 3)),
+    sector_code TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    open REAL NOT NULL,
+    high REAL NOT NULL,
+    low REAL NOT NULL,
+    close REAL NOT NULL,
+    volume INTEGER NULL,
+    amount REAL NULL,
+    change_pct REAL NULL,
+    source TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (
+        sector_type,
+        sector_level,
+        sector_code,
+        trade_date
+    )
+);
+"""
+
+UPSERT_SECTOR_REGISTRY_SQL: Final[str] = """
+INSERT INTO sector_registry (
+    sector_type, sector_level, sector_code, sector_name, source, is_active, updated_at
+)
+VALUES (?, ?, ?, ?, ?, 1, ?)
+ON CONFLICT(sector_type, sector_level, sector_code) DO UPDATE SET
+    sector_name = excluded.sector_name,
+    source = excluded.source,
+    is_active = 1,
+    updated_at = excluded.updated_at;
+"""
+
+UPSERT_SECTOR_DAILY_SQL: Final[str] = """
+INSERT INTO sector_daily (
+    sector_type, sector_level, sector_code, trade_date,
+    open, high, low, close, volume, amount, change_pct, source, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(sector_type, sector_level, sector_code, trade_date) DO UPDATE SET
+    open = excluded.open,
+    high = excluded.high,
+    low = excluded.low,
+    close = excluded.close,
+    volume = excluded.volume,
+    amount = excluded.amount,
+    change_pct = excluded.change_pct,
+    source = excluded.source,
+    updated_at = excluded.updated_at;
+"""
+
 
 def _validate_symbol(symbol: str) -> None:
     """Validate a six-digit stock code."""
@@ -166,6 +251,8 @@ def init_database(
             connection.execute(CREATE_STOCK_DAILY_TABLE_SQL)
             connection.execute(CREATE_INDEX_DAILY_TABLE_SQL)
             connection.execute(CREATE_MARKET_DAILY_TABLE_SQL)
+            connection.execute(CREATE_SECTOR_REGISTRY_TABLE_SQL)
+            connection.execute(CREATE_SECTOR_DAILY_TABLE_SQL)
     except sqlite3.Error as exc:
         raise RuntimeError("Unable to initialize database") from exc
 
@@ -528,4 +615,226 @@ def get_latest_market_trade_date(
             row = connection.execute("SELECT MAX(trade_date) FROM market_daily").fetchone()
     except sqlite3.Error as exc:
         raise RuntimeError("Unable to query latest market trade date") from exc
+    return None if row is None or row[0] is None else str(row[0])
+
+
+def save_sector_registry_snapshot(
+    definitions: Iterable[SectorDefinition],
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+) -> int:
+    """Atomically replace the current active industry registry snapshot."""
+    normalized = normalize_sector_registry(definitions)
+    sector_types = {item.sector_type for item in normalized}
+    if len(sector_types) != 1:
+        raise ValueError("Sector registry snapshot must contain one sector type")
+    sector_type = normalized[0].sector_type
+    updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    records = [
+        (
+            item.sector_type,
+            item.sector_level,
+            item.sector_code,
+            item.sector_name,
+            item.source,
+            updated_at,
+        )
+        for item in normalized
+    ]
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "UPDATE sector_registry SET is_active = 0, updated_at = ? WHERE sector_type = ?",
+                (updated_at, sector_type),
+            )
+            connection.executemany(UPSERT_SECTOR_REGISTRY_SQL, records)
+    except sqlite3.Error as exc:
+        raise RuntimeError("Unable to save sector registry snapshot") from exc
+    return len(records)
+
+
+def load_sector_registry(
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+    sector_level: int | None = None,
+    active_only: bool = True,
+) -> pd.DataFrame:
+    """Load current or historical registry rows in stable business-key order."""
+    if sector_level is not None:
+        sector_level = validate_sector_level(sector_level)
+    if not isinstance(active_only, bool):
+        raise TypeError("active_only must be a bool")
+    conditions = ["sector_type = ?"]
+    params: list[object] = [EASTMONEY_INDUSTRY_SECTOR_TYPE]
+    if sector_level is not None:
+        conditions.append("sector_level = ?")
+        params.append(sector_level)
+    if active_only:
+        conditions.append("is_active = 1")
+    query = f"""
+    SELECT sector_type, sector_level, sector_code, sector_name, source, is_active, updated_at
+    FROM sector_registry
+    WHERE {' AND '.join(conditions)}
+    ORDER BY sector_level ASC, sector_code ASC;
+    """
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            result = pd.read_sql_query(query, connection, params=params)
+    except (sqlite3.Error, pd.errors.DatabaseError) as exc:
+        raise RuntimeError("Unable to load sector registry") from exc
+    result["is_active"] = result["is_active"].astype(bool)
+    return result
+
+
+def get_sector_definition(
+    sector_type: str,
+    sector_level: int,
+    sector_code: str,
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+    active_only: bool = True,
+) -> SectorDefinition | None:
+    """Return one database-backed sector definition, if present."""
+    if sector_type != EASTMONEY_INDUSTRY_SECTOR_TYPE:
+        raise ValueError(f"Invalid sector type: {sector_type!r}")
+    level = validate_sector_level(sector_level)
+    code = validate_sector_code(sector_code)
+    if not isinstance(active_only, bool):
+        raise TypeError("active_only must be a bool")
+    active_clause = " AND is_active = 1" if active_only else ""
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            row = connection.execute(
+                "SELECT sector_name, source FROM sector_registry "
+                "WHERE sector_type = ? AND sector_level = ? AND sector_code = ?"
+                + active_clause,
+                (sector_type, level, code),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"Unable to load sector definition for {code}") from exc
+    if row is None:
+        return None
+    return SectorDefinition(sector_type, level, code, str(row[0]), str(row[1]))
+
+
+def save_sector_daily_kline(
+    definition: SectorDefinition,
+    data: pd.DataFrame,
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+    source: str = EASTMONEY_INDUSTRY_KLINE_SOURCE,
+) -> int:
+    """Idempotently store a validated daily batch for an active sector."""
+    if not isinstance(definition, SectorDefinition):
+        raise TypeError("definition must be a SectorDefinition")
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("source must be a non-empty string")
+    current = get_sector_definition(
+        definition.sector_type,
+        definition.sector_level,
+        definition.sector_code,
+        database_path=database_path,
+        active_only=True,
+    )
+    if current is None:
+        raise ValueError(f"Sector is not active in registry: {definition.sector_code}")
+    if current.sector_name != definition.sector_name:
+        raise ValueError(f"Sector name does not match current registry: {definition.sector_code}")
+    if current.source != definition.source:
+        raise ValueError(f"Sector registry source does not match: {definition.sector_code}")
+    normalized = normalize_sector_daily_kline(data)
+    if normalized.empty:
+        return 0
+    updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    records = []
+    for row in normalized.itertuples(index=False, name=None):
+        trade_date, open_price, high_price, low_price, close_price, volume, amount, change_pct = row
+        records.append((
+            definition.sector_type,
+            definition.sector_level,
+            definition.sector_code,
+            trade_date,
+            float(open_price),
+            float(high_price),
+            float(low_price),
+            float(close_price),
+            None if pd.isna(volume) else int(volume),
+            None if pd.isna(amount) else float(amount),
+            None if pd.isna(change_pct) else float(change_pct),
+            source.strip(),
+            updated_at,
+        ))
+    path = _prepare_database_path(database_path)
+    try:
+        with sqlite3.connect(path) as connection:
+            connection.executemany(UPSERT_SECTOR_DAILY_SQL, records)
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"Unable to save sector daily data for {definition.sector_code}") from exc
+    return len(records)
+
+
+def load_sector_daily_kline(
+    definition: SectorDefinition,
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    """Load historical sector facts, including facts for inactive definitions."""
+    if not isinstance(definition, SectorDefinition):
+        raise TypeError("definition must be a SectorDefinition")
+    if start_date is not None:
+        start_date = validate_trade_date(start_date)
+    if end_date is not None:
+        end_date = validate_trade_date(end_date)
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
+    conditions = ["sector_type = ?", "sector_level = ?", "sector_code = ?"]
+    params: list[object] = [definition.sector_type, definition.sector_level, definition.sector_code]
+    if start_date is not None:
+        conditions.append("trade_date >= ?")
+        params.append(start_date)
+    if end_date is not None:
+        conditions.append("trade_date <= ?")
+        params.append(end_date)
+    query = f"""
+    SELECT trade_date AS date, open, high, low, close, volume, amount, change_pct
+    FROM sector_daily WHERE {' AND '.join(conditions)} ORDER BY trade_date ASC;
+    """
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            result = pd.read_sql_query(query, connection, params=params)
+    except (sqlite3.Error, pd.errors.DatabaseError) as exc:
+        raise RuntimeError(f"Unable to load sector daily data for {definition.sector_code}") from exc
+    result["volume"] = result["volume"].astype("Int64")
+    return result.loc[:, list(SECTOR_KLINE_COLUMNS)]
+
+
+def get_latest_sector_trade_date(
+    definition: SectorDefinition,
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+) -> str | None:
+    """Return the latest stored trade date for the full sector business key."""
+    if not isinstance(definition, SectorDefinition):
+        raise TypeError("definition must be a SectorDefinition")
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            row = connection.execute(
+                "SELECT MAX(trade_date) FROM sector_daily "
+                "WHERE sector_type = ? AND sector_level = ? AND sector_code = ?",
+                (definition.sector_type, definition.sector_level, definition.sector_code),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"Unable to query latest sector trade date for {definition.sector_code}") from exc
     return None if row is None or row[0] is None else str(row[0])
