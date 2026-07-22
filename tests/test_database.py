@@ -8,6 +8,8 @@ import pandas as pd
 import pytest
 
 from src.data.database import (
+    SECURITY_LISTING_EVENT_RESULT_COLUMNS,
+    SECURITY_MASTER_RESULT_COLUMNS,
     SECTOR_DAILY_PANEL_COLUMNS,
     get_latest_sector_trade_date,
     get_latest_market_trade_date,
@@ -27,6 +29,10 @@ from src.data.database import (
     save_sector_daily_kline,
     save_sector_registry_snapshot,
     load_sector_daily_panel,
+    load_security_listing_events,
+    load_security_master,
+    save_security_listing_events,
+    save_security_master,
 )
 from src.data.market import (
     SSE_AMOUNT_SOURCE,
@@ -636,3 +642,467 @@ def test_load_sector_daily_panel_wraps_initialization_runtime_error(tmp_path: Pa
     with pytest.raises(RuntimeError, match="^Unable to load sector daily panel$") as captured:
         load_sector_daily_panel(database_path=tmp_path / "test.db")
     assert captured.value.__cause__ is original
+
+
+def security_master_frame(
+    *,
+    symbol: str = "600000",
+    exchange: str = "XSHG",
+    board: str = "SSE_MAIN",
+    name: str = "浦发银行",
+    list_date: str = "1999-11-10",
+    delist_date=None,
+    status: str = "LISTED",
+    source: str = "SSE_OFFICIAL",
+    as_of: str = "2026-07-22",
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "local_symbol": symbol,
+                "exchange": exchange,
+                "asset_type": "COMMON_STOCK",
+                "board": board,
+                "current_name": name,
+                "list_date": list_date,
+                "delist_date": delist_date,
+                "current_listing_status": status,
+                "source": source,
+                "source_as_of_date": as_of,
+            }
+        ]
+    )
+
+
+def security_event_frame(
+    *,
+    symbol: str = "600000",
+    exchange: str = "XSHG",
+    event_type: str = "LISTED",
+    event_date: str = "1999-11-10",
+    source: str = "SSE_OFFICIAL",
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "local_symbol": symbol,
+                "exchange": exchange,
+                "asset_type": "COMMON_STOCK",
+                "event_type": event_type,
+                "event_date": event_date,
+                "source": source,
+            }
+        ]
+    )
+
+
+def test_security_tables_initialize_idempotently_with_exact_schema(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    init_database(database_path)
+    init_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        master = [(row[1], row[2], row[3], row[5]) for row in connection.execute(
+            "PRAGMA table_info(security_master)"
+        )]
+        events = [(row[1], row[2], row[3], row[5]) for row in connection.execute(
+            "PRAGMA table_info(security_listing_event)"
+        )]
+    assert {
+        "stock_daily", "index_daily", "market_daily", "sector_registry",
+        "sector_daily", "security_master", "security_listing_event",
+    } <= tables
+    assert master == [
+        ("security_id", "INTEGER", 0, 1),
+        ("local_symbol", "TEXT", 1, 0),
+        ("exchange", "TEXT", 1, 0),
+        ("asset_type", "TEXT", 1, 0),
+        ("board", "TEXT", 1, 0),
+        ("current_name", "TEXT", 1, 0),
+        ("list_date", "TEXT", 1, 0),
+        ("delist_date", "TEXT", 0, 0),
+        ("current_listing_status", "TEXT", 1, 0),
+        ("source", "TEXT", 1, 0),
+        ("source_as_of_date", "TEXT", 1, 0),
+        ("updated_at", "TEXT", 1, 0),
+    ]
+    assert events == [
+        ("security_id", "INTEGER", 1, 1),
+        ("event_type", "TEXT", 1, 2),
+        ("event_date", "TEXT", 1, 0),
+        ("source", "TEXT", 1, 0),
+        ("updated_at", "TEXT", 1, 0),
+    ]
+
+
+def test_security_master_natural_unique_key_is_enforced(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_security_master(security_master_frame(), database_path=database_path)
+    with sqlite3.connect(database_path) as connection:
+        original = connection.execute(
+            "SELECT * FROM security_master WHERE local_symbol = '600000'"
+        ).fetchone()
+        values = list(original)
+        values[0] = None
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO security_master VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                values,
+            )
+
+
+def test_security_master_initial_save_reads_identity_and_provenance(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    assert save_security_master(security_master_frame(), database_path=database_path) == 1
+    result = load_security_master(database_path=database_path)
+    assert result.columns.tolist() == list(SECURITY_MASTER_RESULT_COLUMNS)
+    assert result.loc[0, "security_id"] == 1
+    assert result.loc[0, "local_symbol"] == "600000"
+    assert result.loc[0, "source"] == "SSE_OFFICIAL"
+    assert result.loc[0, "source_as_of_date"] == "2026-07-22"
+    assert result.loc[0, "updated_at"].endswith("+00:00")
+
+
+def test_security_master_identical_snapshot_is_idempotent(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    frame = security_master_frame()
+    assert save_security_master(frame, database_path=database_path) == 1
+    first = load_security_master(database_path=database_path)
+    assert save_security_master(frame, database_path=database_path) == 0
+    second = load_security_master(database_path=database_path)
+    pd.testing.assert_frame_equal(first, second)
+
+
+def test_security_master_newer_snapshot_updates_name_and_preserves_id(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_security_master(security_master_frame(), database_path=database_path)
+    original_id = load_security_master(database_path=database_path).loc[0, "security_id"]
+    updated = security_master_frame(name="浦发银行股份", as_of="2026-07-23")
+    assert save_security_master(updated, database_path=database_path) == 1
+    result = load_security_master(database_path=database_path)
+    assert result.loc[0, "security_id"] == original_id
+    assert result.loc[0, "current_name"] == "浦发银行股份"
+
+
+def test_security_master_rejects_older_snapshot_without_change(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    current = security_master_frame()
+    save_security_master(current, database_path=database_path)
+    with pytest.raises(ValueError, match="Older security snapshot"):
+        save_security_master(
+            security_master_frame(name="Old", as_of="2026-07-21"),
+            database_path=database_path,
+        )
+    assert load_security_master(database_path=database_path).loc[0, "current_name"] == "浦发银行"
+
+
+def test_security_master_rejects_conflicting_same_date_snapshot(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_security_master(security_master_frame(), database_path=database_path)
+    with pytest.raises(ValueError, match="same-date"):
+        save_security_master(
+            security_master_frame(name="Conflict"), database_path=database_path
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("board", "SSE_STAR"), ("list_date", "1999-11-11")],
+)
+def test_security_master_rejects_stable_fact_change(tmp_path: Path, field: str, value: str):
+    database_path = tmp_path / "test.db"
+    save_security_master(security_master_frame(), database_path=database_path)
+    changed = security_master_frame(as_of="2026-07-23")
+    changed.loc[:, field] = value
+    with pytest.raises(ValueError, match="Stable security identity"):
+        save_security_master(changed, database_path=database_path)
+
+
+def test_security_master_allows_listed_to_delisted_transition(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_security_master(security_master_frame(), database_path=database_path)
+    delisted = security_master_frame(
+        delist_date="2026-07-23", status="DELISTED", as_of="2026-07-23"
+    )
+    assert save_security_master(delisted, database_path=database_path) == 1
+    result = load_security_master(database_path=database_path)
+    assert result.loc[0, "current_listing_status"] == "DELISTED"
+    assert result.loc[0, "delist_date"] == "2026-07-23"
+
+
+def test_security_master_rejects_changed_delist_date_without_event(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    original = security_master_frame(
+        delist_date="2026-07-20", status="DELISTED", as_of="2026-07-20"
+    )
+    save_security_master(original, database_path=database_path)
+    changed = security_master_frame(
+        delist_date="2026-07-21", status="DELISTED", as_of="2026-07-23"
+    )
+    with pytest.raises(ValueError, match="Delisting date is immutable"):
+        save_security_master(changed, database_path=database_path)
+    result = load_security_master(database_path=database_path)
+    assert result.loc[0, "delist_date"] == "2026-07-20"
+    assert result.loc[0, "source_as_of_date"] == "2026-07-20"
+
+
+def test_security_master_allows_delisted_name_and_source_update(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    original = security_master_frame(
+        delist_date="2026-07-20", status="DELISTED", as_of="2026-07-20"
+    )
+    save_security_master(original, database_path=database_path)
+    before = load_security_master(database_path=database_path).iloc[0]
+    updated = security_master_frame(
+        name="退市后名称快照",
+        delist_date="2026-07-20",
+        status="DELISTED",
+        source="SSE_DELIST_OFFICIAL",
+        as_of="2026-07-23",
+    )
+    assert save_security_master(updated, database_path=database_path) == 1
+    after = load_security_master(database_path=database_path).iloc[0]
+    assert after["security_id"] == before["security_id"]
+    assert after["current_name"] == "退市后名称快照"
+    assert after["source"] == "SSE_DELIST_OFFICIAL"
+    assert after["delist_date"] == "2026-07-20"
+
+
+def test_security_master_rejects_delisted_to_listed_transition(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_security_master(
+        security_master_frame(
+            delist_date="2026-07-23", status="DELISTED", as_of="2026-07-23"
+        ),
+        database_path=database_path,
+    )
+    with pytest.raises(ValueError, match="Relisting"):
+        save_security_master(
+            security_master_frame(as_of="2026-07-24"), database_path=database_path
+        )
+
+
+def test_security_listing_event_initial_save_and_idempotency(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_security_master(security_master_frame(), database_path=database_path)
+    event = security_event_frame()
+    assert save_security_listing_events(event, database_path=database_path) == 1
+    first = load_security_listing_events(database_path=database_path)
+    assert first.columns.tolist() == list(SECURITY_LISTING_EVENT_RESULT_COLUMNS)
+    assert first.loc[0, "event_type"] == "LISTED"
+    assert save_security_listing_events(event, database_path=database_path) == 0
+    pd.testing.assert_frame_equal(
+        first, load_security_listing_events(database_path=database_path)
+    )
+
+
+@pytest.mark.parametrize(
+    ("event_date", "source"),
+    [("1999-11-11", "SSE_OFFICIAL"), ("1999-11-10", "OTHER")],
+)
+def test_security_listing_event_rejects_conflicts(tmp_path: Path, event_date: str, source: str):
+    database_path = tmp_path / "test.db"
+    save_security_master(security_master_frame(), database_path=database_path)
+    save_security_listing_events(security_event_frame(), database_path=database_path)
+    with pytest.raises(ValueError, match="listing event|Listing event"):
+        save_security_listing_events(
+            security_event_frame(event_date=event_date, source=source),
+            database_path=database_path,
+        )
+
+
+def test_security_listing_event_rejects_unknown_security(tmp_path: Path):
+    with pytest.raises(ValueError, match="Unknown security"):
+        save_security_listing_events(
+            security_event_frame(), database_path=tmp_path / "test.db"
+        )
+
+
+def test_security_listing_event_must_match_master_dates(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_security_master(security_master_frame(), database_path=database_path)
+    with pytest.raises(ValueError, match="does not match"):
+        save_security_listing_events(
+            security_event_frame(event_date="1999-11-11"), database_path=database_path
+        )
+    with pytest.raises(ValueError, match="does not match"):
+        save_security_listing_events(
+            security_event_frame(event_type="DELISTED", event_date="2026-07-23"),
+            database_path=database_path,
+        )
+
+
+def test_security_listing_event_batch_failure_rolls_back(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    masters = pd.concat(
+        [
+            security_master_frame(
+                symbol="000001", exchange="XSHE", board="SZSE_MAIN",
+                name="平安银行", list_date="1991-04-03", source="SZSE_OFFICIAL",
+            ),
+            security_master_frame(),
+        ],
+        ignore_index=True,
+    )
+    save_security_master(masters, database_path=database_path)
+    events = pd.concat(
+        [
+            security_event_frame(
+                symbol="000001", exchange="XSHE", event_date="1991-04-03",
+                source="SZSE_OFFICIAL",
+            ),
+            security_event_frame(event_date="1999-11-11"),
+        ],
+        ignore_index=True,
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        save_security_listing_events(events, database_path=database_path)
+    assert load_security_listing_events(database_path=database_path).empty
+
+
+def test_security_master_batch_failure_rolls_back(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    first = security_master_frame(
+        symbol="000001", exchange="XSHE", board="SZSE_MAIN", name="平安银行",
+        list_date="1991-04-03", source="SZSE_OFFICIAL",
+    )
+    second = security_master_frame(
+        delist_date="2026-07-20", status="DELISTED", as_of="2026-07-20"
+    )
+    save_security_master(
+        pd.concat([first, second], ignore_index=True), database_path=database_path
+    )
+    batch = pd.concat(
+        [
+            first.assign(current_name="合法的新名称", source_as_of_date="2026-07-23"),
+            security_master_frame(
+                delist_date="2026-07-21", status="DELISTED", as_of="2026-07-23"
+            ),
+        ],
+        ignore_index=True,
+    )
+    with pytest.raises(ValueError, match="Delisting date is immutable"):
+        save_security_master(batch, database_path=database_path)
+    result = load_security_master(database_path=database_path)
+    first_after = result[result["exchange"] == "XSHE"].iloc[0]
+    second_after = result[result["exchange"] == "XSHG"].iloc[0]
+    assert first_after["current_name"] == "平安银行"
+    assert first_after["source_as_of_date"] == "2026-07-22"
+    assert second_after["delist_date"] == "2026-07-20"
+
+
+def test_security_loaders_filter_sort_and_return_fixed_empty_columns(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    frames = pd.concat(
+        [
+            security_master_frame(),
+            security_master_frame(
+                symbol="000001", exchange="XSHE", board="SZSE_MAIN",
+                name="平安银行", list_date="1991-04-03", source="SZSE_OFFICIAL",
+            ),
+        ],
+        ignore_index=True,
+    )
+    save_security_master(frames, database_path=database_path)
+    save_security_listing_events(
+        pd.concat(
+            [
+                security_event_frame(),
+                security_event_frame(
+                    symbol="000001", exchange="XSHE", event_date="1991-04-03",
+                    source="SZSE_OFFICIAL",
+                ),
+            ],
+            ignore_index=True,
+        ),
+        database_path=database_path,
+    )
+    assert load_security_master(
+        database_path=database_path, exchanges="XSHE", boards=["SZSE_MAIN"],
+        listing_status="LISTED",
+    )["local_symbol"].tolist() == ["000001"]
+    assert load_security_listing_events(
+        database_path=database_path, local_symbols=["600000"]
+    )["local_symbol"].tolist() == ["600000"]
+    empty_master = load_security_master(database_path=database_path, exchanges=[])
+    empty_events = load_security_listing_events(database_path=database_path, local_symbols=[])
+    assert empty_master.empty
+    assert empty_master.columns.tolist() == list(SECURITY_MASTER_RESULT_COLUMNS)
+    assert empty_events.empty
+    assert empty_events.columns.tolist() == list(SECURITY_LISTING_EVENT_RESULT_COLUMNS)
+
+
+@pytest.mark.parametrize("symbol", ["６０００００", "٦٠٠٠٠٠", "60000A", "60000 ", 600000, True])
+def test_security_listing_event_loader_rejects_non_ascii_symbol_filter(
+    tmp_path: Path,
+    symbol,
+):
+    with pytest.raises(ValueError, match="Invalid stock code"):
+        load_security_listing_events(
+            database_path=tmp_path / "test.db", local_symbols=[symbol]
+        )
+
+
+def test_security_identity_and_events_distinguish_same_symbol_across_exchanges(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    masters = pd.concat(
+        [
+            security_master_frame(),
+            security_master_frame(
+                symbol="600000", exchange="XSHE", board="SZSE_MAIN",
+                name="同代码深市测试证券", list_date="2000-01-01",
+                source="SZSE_OFFICIAL",
+            ),
+        ],
+        ignore_index=True,
+    )
+    assert save_security_master(masters, database_path=database_path) == 2
+    loaded_master = load_security_master(database_path=database_path)
+    assert loaded_master["local_symbol"].tolist() == ["600000", "600000"]
+    assert loaded_master["exchange"].tolist() == ["XSHE", "XSHG"]
+    assert loaded_master["security_id"].nunique() == 2
+
+    events = pd.concat(
+        [
+            security_event_frame(),
+            security_event_frame(
+                symbol="600000", exchange="XSHE", event_date="2000-01-01",
+                source="SZSE_OFFICIAL",
+            ),
+        ],
+        ignore_index=True,
+    )
+    assert save_security_listing_events(events, database_path=database_path) == 2
+    loaded_events = load_security_listing_events(
+        database_path=database_path, local_symbols=["600000"]
+    )
+    assert len(loaded_events) == 2
+    assert loaded_events["security_id"].nunique() == 2
+    assert loaded_events[["exchange", "event_date"]].to_dict("records") == [
+        {"exchange": "XSHE", "event_date": "2000-01-01"},
+        {"exchange": "XSHG", "event_date": "1999-11-10"},
+    ]
+
+
+def test_security_listing_event_foreign_key_restricts_master_delete(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_security_master(security_master_frame(), database_path=database_path)
+    save_security_listing_events(security_event_frame(), database_path=database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM security_master WHERE local_symbol = '600000'")
+
+
+def test_security_tables_do_not_change_existing_stock_daily_behavior(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_daily_kline("000021", make_kline_data(), database_path=database_path)
+    save_security_master(security_master_frame(), database_path=database_path)
+    loaded = load_daily_kline("000021", database_path=database_path)
+    assert loaded["date"].tolist() == ["2026-07-16", "2026-07-17"]
+    assert get_latest_trade_date("000021", database_path=database_path) == "2026-07-17"

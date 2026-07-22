@@ -23,6 +23,16 @@ from src.data.sector import (
     validate_sector_code,
     validate_sector_level,
 )
+from src.data.security import (
+    SECURITY_ASSET_TYPES,
+    SECURITY_BOARDS,
+    SECURITY_EXCHANGES,
+    SECURITY_LISTING_EVENT_TYPES,
+    SECURITY_LISTING_STATUSES,
+    normalize_security_listing_events,
+    normalize_security_master,
+    validate_local_symbol,
+)
 
 
 DEFAULT_DATABASE_PATH: Final[Path] = Path("data/trading_brain.db")
@@ -236,15 +246,77 @@ ON CONFLICT(sector_type, sector_level, sector_code, trade_date) DO UPDATE SET
     updated_at = excluded.updated_at;
 """
 
+CREATE_SECURITY_MASTER_TABLE_SQL: Final[str] = """
+CREATE TABLE IF NOT EXISTS security_master (
+    security_id INTEGER PRIMARY KEY,
+    local_symbol TEXT NOT NULL
+        CHECK (length(local_symbol) = 6 AND local_symbol NOT GLOB '*[^0-9]*'),
+    exchange TEXT NOT NULL
+        CHECK (exchange IN ('XSHG', 'XSHE')),
+    asset_type TEXT NOT NULL
+        CHECK (asset_type = 'COMMON_STOCK'),
+    board TEXT NOT NULL
+        CHECK (board IN ('SSE_MAIN', 'SSE_STAR', 'SZSE_MAIN', 'SZSE_CHINEXT')),
+    current_name TEXT NOT NULL
+        CHECK (length(trim(current_name)) > 0),
+    list_date TEXT NOT NULL,
+    delist_date TEXT,
+    current_listing_status TEXT NOT NULL
+        CHECK (current_listing_status IN ('LISTED', 'DELISTED')),
+    source TEXT NOT NULL
+        CHECK (length(trim(source)) > 0),
+    source_as_of_date TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (exchange, asset_type, local_symbol),
+    CHECK (
+        (exchange = 'XSHG' AND board IN ('SSE_MAIN', 'SSE_STAR'))
+        OR (exchange = 'XSHE' AND board IN ('SZSE_MAIN', 'SZSE_CHINEXT'))
+    ),
+    CHECK (
+        (current_listing_status = 'LISTED' AND delist_date IS NULL)
+        OR (
+            current_listing_status = 'DELISTED'
+            AND delist_date IS NOT NULL
+            AND delist_date >= list_date
+        )
+    )
+);
+"""
 
-def _validate_symbol(symbol: str) -> None:
+CREATE_SECURITY_LISTING_EVENT_TABLE_SQL: Final[str] = """
+CREATE TABLE IF NOT EXISTS security_listing_event (
+    security_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL
+        CHECK (event_type IN ('LISTED', 'DELISTED')),
+    event_date TEXT NOT NULL,
+    source TEXT NOT NULL
+        CHECK (length(trim(source)) > 0),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (security_id, event_type),
+    FOREIGN KEY (security_id)
+        REFERENCES security_master(security_id)
+        ON DELETE RESTRICT
+);
+"""
+
+SECURITY_MASTER_RESULT_COLUMNS: Final[tuple[str, ...]] = (
+    "security_id", "local_symbol", "exchange", "asset_type", "board",
+    "current_name", "list_date", "delist_date", "current_listing_status",
+    "source", "source_as_of_date", "updated_at",
+)
+
+SECURITY_LISTING_EVENT_RESULT_COLUMNS: Final[tuple[str, ...]] = (
+    "security_id", "local_symbol", "exchange", "asset_type", "event_type",
+    "event_date", "source", "updated_at",
+)
+
+
+def _validate_symbol(symbol: object) -> None:
     """Validate a six-digit stock code."""
-    if (
-        not isinstance(symbol, str)
-        or len(symbol) != 6
-        or not symbol.isdigit()
-    ):
-        raise ValueError(f"Invalid stock code: {symbol!r}")
+    try:
+        validate_local_symbol(symbol)
+    except ValueError as exc:
+        raise ValueError(f"Invalid stock code: {symbol!r}") from exc
 
 
 def _prepare_database_path(
@@ -269,6 +341,8 @@ def init_database(
             connection.execute(CREATE_MARKET_DAILY_TABLE_SQL)
             connection.execute(CREATE_SECTOR_REGISTRY_TABLE_SQL)
             connection.execute(CREATE_SECTOR_DAILY_TABLE_SQL)
+            connection.execute(CREATE_SECURITY_MASTER_TABLE_SQL)
+            connection.execute(CREATE_SECURITY_LISTING_EVENT_TABLE_SQL)
     except sqlite3.Error as exc:
         raise RuntimeError("Unable to initialize database") from exc
 
@@ -931,3 +1005,318 @@ def load_sector_daily_panel(
     for column in ("open", "high", "low", "close", "amount", "change_pct"):
         result[column] = result[column].astype("float64")
     return result
+
+
+def save_security_master(
+    data: pd.DataFrame,
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+) -> int:
+    """Insert or advance strictly ordered current security snapshots atomically."""
+    normalized = normalize_security_master(data)
+    if normalized.empty:
+        return 0
+
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    changed = 0
+
+    try:
+        with sqlite3.connect(path) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            for record in normalized.to_dict("records"):
+                key = (
+                    record["exchange"],
+                    record["asset_type"],
+                    record["local_symbol"],
+                )
+                existing = connection.execute(
+                    """
+                    SELECT security_id, board, current_name, list_date, delist_date,
+                           current_listing_status, source, source_as_of_date
+                    FROM security_master
+                    WHERE exchange = ? AND asset_type = ? AND local_symbol = ?
+                    """,
+                    key,
+                ).fetchone()
+
+                if existing is None:
+                    connection.execute(
+                        """
+                        INSERT INTO security_master (
+                            local_symbol, exchange, asset_type, board, current_name,
+                            list_date, delist_date, current_listing_status, source,
+                            source_as_of_date, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            record["local_symbol"], record["exchange"],
+                            record["asset_type"], record["board"],
+                            record["current_name"], record["list_date"],
+                            record["delist_date"], record["current_listing_status"],
+                            record["source"], record["source_as_of_date"], updated_at,
+                        ),
+                    )
+                    changed += 1
+                    continue
+
+                (
+                    security_id,
+                    old_board,
+                    old_name,
+                    old_list_date,
+                    old_delist_date,
+                    old_status,
+                    old_source,
+                    old_as_of,
+                ) = existing
+                new_as_of = record["source_as_of_date"]
+                if new_as_of < old_as_of:
+                    raise ValueError(f"Older security snapshot rejected for {key!r}")
+
+                comparable_old = (
+                    old_board, old_name, old_list_date, old_delist_date,
+                    old_status, old_source, old_as_of,
+                )
+                comparable_new = (
+                    record["board"], record["current_name"], record["list_date"],
+                    record["delist_date"], record["current_listing_status"],
+                    record["source"], new_as_of,
+                )
+                if new_as_of == old_as_of:
+                    if comparable_new == comparable_old:
+                        continue
+                    raise ValueError(f"Conflicting same-date security snapshot for {key!r}")
+
+                if record["board"] != old_board or record["list_date"] != old_list_date:
+                    raise ValueError(f"Stable security identity changed for {key!r}")
+                if old_status == "DELISTED" and record["current_listing_status"] == "LISTED":
+                    raise ValueError(f"Relisting is not supported for {key!r}")
+                if old_status == "DELISTED" and record["delist_date"] != old_delist_date:
+                    raise ValueError(f"Delisting date is immutable for {key!r}")
+
+                delisted_event = connection.execute(
+                    """
+                    SELECT event_date FROM security_listing_event
+                    WHERE security_id = ? AND event_type = 'DELISTED'
+                    """,
+                    (security_id,),
+                ).fetchone()
+                if (
+                    delisted_event is not None
+                    and record["delist_date"] != delisted_event[0]
+                ):
+                    raise ValueError(f"Security snapshot conflicts with DELISTED event for {key!r}")
+
+                connection.execute(
+                    """
+                    UPDATE security_master
+                    SET current_name = ?, delist_date = ?, current_listing_status = ?,
+                        source = ?, source_as_of_date = ?, updated_at = ?
+                    WHERE security_id = ?
+                    """,
+                    (
+                        record["current_name"], record["delist_date"],
+                        record["current_listing_status"], record["source"],
+                        new_as_of, updated_at, security_id,
+                    ),
+                )
+                changed += 1
+    except sqlite3.Error as exc:
+        raise RuntimeError("Unable to save security master") from exc
+    return changed
+
+
+def _filter_values(
+    values: Iterable[str] | str | None,
+    *,
+    field: str,
+    allowed: frozenset[str] | None = None,
+) -> tuple[str, ...] | None:
+    if values is None:
+        return None
+    if isinstance(values, str):
+        items = (values,)
+    else:
+        try:
+            items = tuple(values)
+        except TypeError as exc:
+            raise TypeError(f"{field} must be a string or iterable of strings") from exc
+    for item in items:
+        if not isinstance(item, str) or not item:
+            raise ValueError(f"Invalid {field} filter: {item!r}")
+        if allowed is not None and item not in allowed:
+            raise ValueError(f"Invalid {field} filter: {item!r}")
+    return tuple(dict.fromkeys(items))
+
+
+def _symbol_filter_values(
+    values: Iterable[str] | str | None,
+) -> tuple[str, ...] | None:
+    if values is None:
+        return None
+    if isinstance(values, str):
+        items: tuple[object, ...] = (values,)
+    else:
+        try:
+            items = tuple(values)
+        except TypeError as exc:
+            raise TypeError(
+                "local_symbols must be a string or iterable of strings"
+            ) from exc
+    validated: list[str] = []
+    for item in items:
+        _validate_symbol(item)
+        assert isinstance(item, str)
+        validated.append(item)
+    return tuple(dict.fromkeys(validated))
+
+
+def load_security_master(
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+    exchanges: Iterable[str] | str | None = None,
+    boards: Iterable[str] | str | None = None,
+    listing_status: Iterable[str] | str | None = None,
+) -> pd.DataFrame:
+    """Load current security snapshots without inferring historical state."""
+    exchange_values = _filter_values(
+        exchanges, field="exchange", allowed=SECURITY_EXCHANGES
+    )
+    board_values = _filter_values(boards, field="board", allowed=SECURITY_BOARDS)
+    status_values = _filter_values(
+        listing_status, field="listing_status", allowed=SECURITY_LISTING_STATUSES
+    )
+    conditions: list[str] = []
+    params: list[object] = []
+    for column, values in (
+        ("exchange", exchange_values),
+        ("board", board_values),
+        ("current_listing_status", status_values),
+    ):
+        if values is not None:
+            if not values:
+                conditions.append("0")
+            else:
+                conditions.append(f"{column} IN ({','.join('?' for _ in values)})")
+                params.extend(values)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = f"""
+    SELECT security_id, local_symbol, exchange, asset_type, board, current_name,
+           list_date, delist_date, current_listing_status, source,
+           source_as_of_date, updated_at
+    FROM security_master
+    {where}
+    ORDER BY exchange ASC, local_symbol ASC;
+    """
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            result = pd.read_sql_query(query, connection, params=params)
+    except (sqlite3.Error, pd.errors.DatabaseError) as exc:
+        raise RuntimeError("Unable to load security master") from exc
+    return result.loc[:, list(SECURITY_MASTER_RESULT_COLUMNS)]
+
+
+def save_security_listing_events(
+    data: pd.DataFrame,
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+) -> int:
+    """Save dated listing facts atomically without overwriting event history."""
+    normalized = normalize_security_listing_events(data)
+    if normalized.empty:
+        return 0
+
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    inserted = 0
+    try:
+        with sqlite3.connect(path) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            for record in normalized.to_dict("records"):
+                key = (
+                    record["exchange"], record["asset_type"], record["local_symbol"]
+                )
+                master = connection.execute(
+                    """
+                    SELECT security_id, list_date, delist_date
+                    FROM security_master
+                    WHERE exchange = ? AND asset_type = ? AND local_symbol = ?
+                    """,
+                    key,
+                ).fetchone()
+                if master is None:
+                    raise ValueError(f"Unknown security for listing event: {key!r}")
+                security_id, list_date, delist_date = master
+                expected_date = list_date if record["event_type"] == "LISTED" else delist_date
+                if expected_date is None or record["event_date"] != expected_date:
+                    raise ValueError(
+                        f"Listing event does not match security master for {key!r}"
+                    )
+                existing = connection.execute(
+                    """
+                    SELECT event_date, source FROM security_listing_event
+                    WHERE security_id = ? AND event_type = ?
+                    """,
+                    (security_id, record["event_type"]),
+                ).fetchone()
+                if existing is not None:
+                    if existing == (record["event_date"], record["source"]):
+                        continue
+                    raise ValueError(
+                        f"Conflicting listing event for {key!r}/{record['event_type']}"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO security_listing_event (
+                        security_id, event_type, event_date, source, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        security_id, record["event_type"], record["event_date"],
+                        record["source"], updated_at,
+                    ),
+                )
+                inserted += 1
+    except sqlite3.Error as exc:
+        raise RuntimeError("Unable to save security listing events") from exc
+    return inserted
+
+
+def load_security_listing_events(
+    *,
+    database_path: str | PathLike[str] = DEFAULT_DATABASE_PATH,
+    local_symbols: Iterable[str] | str | None = None,
+) -> pd.DataFrame:
+    """Load explicit LISTED/DELISTED facts with identity and provenance."""
+    symbol_values = _symbol_filter_values(local_symbols)
+    conditions = ""
+    params: list[object] = []
+    if symbol_values is not None:
+        if not symbol_values:
+            conditions = "WHERE 0"
+        else:
+            conditions = f"WHERE master.local_symbol IN ({','.join('?' for _ in symbol_values)})"
+            params.extend(symbol_values)
+    query = f"""
+    SELECT event.security_id, master.local_symbol, master.exchange,
+           master.asset_type, event.event_type, event.event_date,
+           event.source, event.updated_at
+    FROM security_listing_event AS event
+    INNER JOIN security_master AS master
+        ON master.security_id = event.security_id
+    {conditions}
+    ORDER BY event.security_id ASC, event.event_date ASC, event.event_type ASC;
+    """
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            result = pd.read_sql_query(query, connection, params=params)
+    except (sqlite3.Error, pd.errors.DatabaseError) as exc:
+        raise RuntimeError("Unable to load security listing events") from exc
+    return result.loc[:, list(SECURITY_LISTING_EVENT_RESULT_COLUMNS)]
