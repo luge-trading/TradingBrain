@@ -33,6 +33,9 @@ from src.data.database import (
     load_security_master,
     save_security_listing_events,
     save_security_master,
+    load_stock_daily_price_revisions,
+    load_stock_daily_prices,
+    save_stock_daily_prices,
 )
 from src.data.market import (
     SSE_AMOUNT_SOURCE,
@@ -1106,3 +1109,237 @@ def test_security_tables_do_not_change_existing_stock_daily_behavior(tmp_path: P
     loaded = load_daily_kline("000021", database_path=database_path)
     assert loaded["date"].tolist() == ["2026-07-16", "2026-07-17"]
     assert get_latest_trade_date("000021", database_path=database_path) == "2026-07-17"
+
+
+def _database_price_frame(security_id: int, **changes) -> pd.DataFrame:
+    row = {
+        "security_id": security_id,
+        "trade_date": "2026-07-21",
+        "adjustment": "QFQ",
+        "source": "EASTMONEY",
+        "provider_adjustment": "fqt=1",
+        "open": 10.0,
+        "high": 12.0,
+        "low": 9.0,
+        "close": 11.0,
+        "volume": 1000,
+        "volume_unit": "PROVIDER_NATIVE",
+        "amount": None,
+        "amount_unit": None,
+        "is_final": True,
+        "provider_as_of_date": "2026-07-21",
+        "observed_at": "2026-07-21T16:00:00+08:00",
+    }
+    row.update(changes)
+    return pd.DataFrame([row])
+
+
+def test_price_schema_index_and_legacy_stock_schema_are_stable(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    init_database(database_path)
+    init_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {"stock_daily_price", "stock_daily_price_revision"} <= tables
+        indexes = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA index_list(stock_daily_price)"
+            )
+        }
+        assert "idx_stock_daily_price_trade_date" in indexes
+        assert "idx_stock_daily_price_series" in indexes
+        series_index_columns = [
+            row[2]
+            for row in connection.execute(
+                "PRAGMA index_info(idx_stock_daily_price_series)"
+            )
+        ]
+        assert series_index_columns == [
+            "security_id",
+            "adjustment",
+            "source",
+            "trade_date",
+        ]
+        stock_columns = [
+            (row[1], row[2], row[3], row[5])
+            for row in connection.execute("PRAGMA table_info(stock_daily)")
+        ]
+        assert stock_columns == [
+            ("symbol", "TEXT", 1, 1),
+            ("trade_date", "TEXT", 1, 2),
+            ("open", "REAL", 1, 0),
+            ("high", "REAL", 1, 0),
+            ("low", "REAL", 1, 0),
+            ("close", "REAL", 1, 0),
+            ("volume", "INTEGER", 1, 0),
+            ("amount", "REAL", 1, 0),
+            ("source", "TEXT", 1, 0),
+            ("updated_at", "TEXT", 1, 0),
+        ]
+        price_pk = [
+            row[1]
+            for row in sorted(
+                (row for row in connection.execute(
+                    "PRAGMA table_info(stock_daily_price)"
+                ) if row[5]),
+                key=lambda row: row[5],
+            )
+        ]
+        assert price_pk == ["security_id", "trade_date", "adjustment", "source"]
+        revision_pk = next(
+            row
+            for row in connection.execute(
+                "PRAGMA table_info(stock_daily_price_revision)"
+            )
+            if row[1] == "revision_id"
+        )
+        assert revision_pk[2] == "INTEGER" and revision_pk[5] == 1
+
+
+def test_price_amount_unit_sql_check_rejects_invalid_pairs(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_security_master(security_master_frame(), database_path=database_path)
+    security_id = int(
+        load_security_master(database_path=database_path).loc[0, "security_id"]
+    )
+    insert_sql = """
+        INSERT INTO stock_daily_price (
+            security_id, trade_date, adjustment, source,
+            provider_adjustment, open, high, low, close, volume,
+            volume_unit, amount, amount_unit, is_final,
+            provider_as_of_date, observed_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    def values(
+        trade_date: str,
+        source: str,
+        amount: float | None,
+        amount_unit: str | None,
+    ) -> tuple[object, ...]:
+        return (
+            security_id,
+            trade_date,
+            "QFQ",
+            source,
+            "fqt=1",
+            10.0,
+            12.0,
+            9.0,
+            11.0,
+            1000,
+            "PROVIDER_NATIVE",
+            amount,
+            amount_unit,
+            1,
+            trade_date,
+            f"{trade_date}T16:00:00+00:00",
+            f"{trade_date}T16:00:00+00:00",
+        )
+
+    with sqlite3.connect(database_path) as connection:
+        accepted = (
+            values("2026-07-21", "NULL_PAIR", None, None),
+            values("2026-07-22", "ZERO_CNY", 0.0, "CNY"),
+            values(
+                "2026-07-23",
+                "NATIVE_AMOUNT",
+                10000.0,
+                "PROVIDER_NATIVE",
+            ),
+        )
+        connection.executemany(insert_sql, accepted)
+        connection.commit()
+
+        rejected = (
+            values("2026-07-24", "MISSING_UNIT", 10000.0, None),
+            values("2026-07-25", "UNIT_WITHOUT_AMOUNT", None, "CNY"),
+            values("2026-07-26", "INVALID_UNIT", 10000.0, "RMB"),
+            values("2026-07-27", "NEGATIVE_AMOUNT", -1.0, "CNY"),
+        )
+        for row in rejected:
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(insert_sql, row)
+            connection.rollback()
+
+        stored_sources = {
+            row[0]
+            for row in connection.execute(
+                "SELECT source FROM stock_daily_price ORDER BY source"
+            )
+        }
+    assert stored_sources == {"NULL_PAIR", "ZERO_CNY", "NATIVE_AMOUNT"}
+
+
+def test_price_series_query_plan_uses_full_prefix_index(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    init_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT *
+            FROM stock_daily_price
+            WHERE security_id = ?
+              AND adjustment = ?
+              AND source = ?
+              AND trade_date BETWEEN ? AND ?
+            ORDER BY security_id, trade_date, adjustment, source
+            """,
+            (1, "QFQ", "EASTMONEY", "2026-01-01", "2026-12-31"),
+        ).fetchall()
+    details = "\n".join(str(row[3]) for row in plan)
+    assert "USING INDEX idx_stock_daily_price_series" in details
+    assert (
+        "security_id=? AND adjustment=? AND source=? "
+        "AND trade_date>? AND trade_date<?"
+    ) in details
+
+
+def test_price_and_revision_foreign_keys_restrict_deletes(tmp_path: Path):
+    database_path = tmp_path / "test.db"
+    save_security_master(security_master_frame(), database_path=database_path)
+    security_id = int(load_security_master(database_path=database_path).loc[0, "security_id"])
+    save_stock_daily_prices(
+        _database_price_frame(security_id), database_path=database_path
+    )
+    save_stock_daily_prices(
+        _database_price_frame(
+            security_id,
+            close=11.5,
+            observed_at="2026-07-21T17:00:00+08:00",
+        ),
+        database_path=database_path,
+    )
+    assert len(load_stock_daily_price_revisions(
+        database_path=database_path,
+        adjustment="QFQ",
+        source="EASTMONEY",
+        security_ids=[security_id],
+    )) == 1
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "DELETE FROM stock_daily_price WHERE security_id = ?",
+                (security_id,),
+            )
+        connection.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "DELETE FROM security_master WHERE security_id = ?",
+                (security_id,),
+            )
+    current = load_stock_daily_prices(
+        database_path=database_path,
+        adjustment="QFQ",
+        source="EASTMONEY",
+        security_ids=[security_id],
+    )
+    assert len(current) == 1 and current.loc[0, "close"] == 11.5

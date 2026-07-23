@@ -33,6 +33,16 @@ from src.data.security import (
     normalize_security_master,
     validate_local_symbol,
 )
+from src.data.price import (
+    PRICE_FACT_FIELDS,
+    PRICE_NULLABLE_FIELDS,
+    StockDailyPriceSaveResult,
+    normalize_stock_daily_prices,
+    validate_price_adjustment,
+    validate_price_date,
+    validate_price_source,
+    validate_security_id,
+)
 
 
 DEFAULT_DATABASE_PATH: Final[Path] = Path("data/trading_brain.db")
@@ -299,6 +309,123 @@ CREATE TABLE IF NOT EXISTS security_listing_event (
 );
 """
 
+CREATE_STOCK_DAILY_PRICE_TABLE_SQL: Final[str] = """
+CREATE TABLE IF NOT EXISTS stock_daily_price (
+    security_id INTEGER NOT NULL,
+    trade_date TEXT NOT NULL,
+    adjustment TEXT NOT NULL
+        CHECK (adjustment IN ('UNADJUSTED', 'QFQ', 'HFQ')),
+    source TEXT NOT NULL
+        CHECK (length(trim(source)) > 0),
+    provider_adjustment TEXT NOT NULL
+        CHECK (length(trim(provider_adjustment)) > 0),
+    open REAL NOT NULL CHECK (open > 0),
+    high REAL NOT NULL CHECK (high > 0),
+    low REAL NOT NULL CHECK (low > 0),
+    close REAL NOT NULL CHECK (close > 0),
+    volume INTEGER NOT NULL CHECK (volume >= 0),
+    volume_unit TEXT NOT NULL
+        CHECK (volume_unit IN ('PROVIDER_NATIVE', 'SHARE', 'LOT')),
+    amount REAL CHECK (amount IS NULL OR amount >= 0),
+    amount_unit TEXT,
+    is_final INTEGER NOT NULL CHECK (is_final IN (0, 1)),
+    provider_as_of_date TEXT,
+    observed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (security_id, trade_date, adjustment, source),
+    FOREIGN KEY (security_id)
+        REFERENCES security_master(security_id)
+        ON DELETE RESTRICT,
+    CHECK (low <= open AND open <= high),
+    CHECK (low <= close AND close <= high),
+    CHECK (
+        (amount IS NULL AND amount_unit IS NULL)
+        OR (
+            amount IS NOT NULL
+            AND amount_unit IS NOT NULL
+            AND amount_unit IN ('PROVIDER_NATIVE', 'CNY')
+        )
+    )
+);
+"""
+
+CREATE_STOCK_DAILY_PRICE_TRADE_DATE_INDEX_SQL: Final[str] = """
+CREATE INDEX IF NOT EXISTS idx_stock_daily_price_trade_date
+ON stock_daily_price (trade_date, adjustment, source, security_id);
+"""
+
+CREATE_STOCK_DAILY_PRICE_SERIES_INDEX_SQL: Final[str] = """
+CREATE INDEX IF NOT EXISTS idx_stock_daily_price_series
+ON stock_daily_price (security_id, adjustment, source, trade_date);
+"""
+
+CREATE_STOCK_DAILY_PRICE_REVISION_TABLE_SQL: Final[str] = """
+CREATE TABLE IF NOT EXISTS stock_daily_price_revision (
+    revision_id INTEGER PRIMARY KEY,
+    security_id INTEGER NOT NULL,
+    trade_date TEXT NOT NULL,
+    adjustment TEXT NOT NULL,
+    source TEXT NOT NULL,
+    revision_number INTEGER NOT NULL CHECK (revision_number > 0),
+    changed_fields TEXT NOT NULL CHECK (length(changed_fields) > 0),
+    old_provider_adjustment TEXT NOT NULL,
+    old_open REAL NOT NULL,
+    old_high REAL NOT NULL,
+    old_low REAL NOT NULL,
+    old_close REAL NOT NULL,
+    old_volume INTEGER NOT NULL,
+    old_volume_unit TEXT NOT NULL,
+    old_amount REAL,
+    old_amount_unit TEXT,
+    old_is_final INTEGER NOT NULL,
+    old_provider_as_of_date TEXT,
+    old_observed_at TEXT NOT NULL,
+    new_provider_adjustment TEXT NOT NULL,
+    new_open REAL NOT NULL,
+    new_high REAL NOT NULL,
+    new_low REAL NOT NULL,
+    new_close REAL NOT NULL,
+    new_volume INTEGER NOT NULL,
+    new_volume_unit TEXT NOT NULL,
+    new_amount REAL,
+    new_amount_unit TEXT,
+    new_is_final INTEGER NOT NULL,
+    new_provider_as_of_date TEXT,
+    new_observed_at TEXT NOT NULL,
+    revised_at TEXT NOT NULL,
+    UNIQUE (security_id, trade_date, adjustment, source, revision_number),
+    FOREIGN KEY (security_id, trade_date, adjustment, source)
+        REFERENCES stock_daily_price(
+            security_id, trade_date, adjustment, source
+        )
+        ON DELETE RESTRICT
+);
+"""
+
+STOCK_DAILY_PRICE_RESULT_COLUMNS: Final[tuple[str, ...]] = (
+    "security_id", "exchange", "asset_type", "local_symbol", "board",
+    "trade_date", "adjustment", "source", "provider_adjustment",
+    "open", "high", "low", "close", "volume", "volume_unit", "amount",
+    "amount_unit", "is_final", "provider_as_of_date", "observed_at",
+    "updated_at",
+)
+
+STOCK_DAILY_PRICE_REVISION_RESULT_COLUMNS: Final[tuple[str, ...]] = (
+    "revision_id", "security_id", "exchange", "asset_type", "local_symbol",
+    "board", "trade_date", "adjustment", "source", "revision_number",
+    "changed_fields", "old_provider_adjustment", "old_open", "old_high",
+    "old_low", "old_close", "old_volume", "old_volume_unit", "old_amount",
+    "old_amount_unit", "old_is_final", "old_provider_as_of_date",
+    "old_observed_at", "new_provider_adjustment", "new_open", "new_high",
+    "new_low", "new_close", "new_volume", "new_volume_unit", "new_amount",
+    "new_amount_unit", "new_is_final", "new_provider_as_of_date",
+    "new_observed_at", "revised_at",
+)
+
+LATEST_STOCK_DAILY_PRICE_DATE_COLUMNS: Final[tuple[str, ...]] = (
+    "security_id", "latest_trade_date",
+)
+
 SECURITY_MASTER_RESULT_COLUMNS: Final[tuple[str, ...]] = (
     "security_id", "local_symbol", "exchange", "asset_type", "board",
     "current_name", "list_date", "delist_date", "current_listing_status",
@@ -343,6 +470,10 @@ def init_database(
             connection.execute(CREATE_SECTOR_DAILY_TABLE_SQL)
             connection.execute(CREATE_SECURITY_MASTER_TABLE_SQL)
             connection.execute(CREATE_SECURITY_LISTING_EVENT_TABLE_SQL)
+            connection.execute(CREATE_STOCK_DAILY_PRICE_TABLE_SQL)
+            connection.execute(CREATE_STOCK_DAILY_PRICE_TRADE_DATE_INDEX_SQL)
+            connection.execute(CREATE_STOCK_DAILY_PRICE_SERIES_INDEX_SQL)
+            connection.execute(CREATE_STOCK_DAILY_PRICE_REVISION_TABLE_SQL)
     except sqlite3.Error as exc:
         raise RuntimeError("Unable to initialize database") from exc
 
@@ -1320,3 +1451,388 @@ def load_security_listing_events(
     except (sqlite3.Error, pd.errors.DatabaseError) as exc:
         raise RuntimeError("Unable to load security listing events") from exc
     return result.loc[:, list(SECURITY_LISTING_EVENT_RESULT_COLUMNS)]
+
+
+def _price_security_id_values(
+    security_ids: Iterable[int] | None,
+) -> tuple[int, ...] | None:
+    if security_ids is None:
+        return None
+    if isinstance(security_ids, (str, bytes)):
+        raise TypeError("security_ids must be an iterable of positive integers")
+    try:
+        items = tuple(security_ids)
+    except TypeError as exc:
+        raise TypeError(
+            "security_ids must be an iterable of positive integers"
+        ) from exc
+    values = tuple(validate_security_id(item) for item in items)
+    if len(set(values)) != len(values):
+        raise ValueError("security_ids must not contain duplicates")
+    return values
+
+
+def _price_query_filters(
+    *,
+    adjustment: object,
+    source: object,
+    security_ids: Iterable[int] | None,
+    start_date: object | None,
+    end_date: object | None,
+    security_column: str,
+    date_column: str,
+) -> tuple[list[str], list[object]]:
+    adjustment_value = validate_price_adjustment(adjustment)
+    source_value = validate_price_source(source)
+    id_values = _price_security_id_values(security_ids)
+    if id_values is None and (start_date is None or end_date is None):
+        raise ValueError(
+            "start_date and end_date are required when security_ids is None"
+        )
+    start_value = (
+        None if start_date is None else validate_price_date(start_date, field="start_date")
+    )
+    end_value = (
+        None if end_date is None else validate_price_date(end_date, field="end_date")
+    )
+    if start_value is not None and end_value is not None and start_value > end_value:
+        raise ValueError("start_date must not be after end_date")
+
+    conditions = ["price.adjustment = ?", "price.source = ?"]
+    params: list[object] = [adjustment_value, source_value]
+    if id_values is not None:
+        if not id_values:
+            conditions.append("0")
+        else:
+            placeholders = ",".join("?" for _ in id_values)
+            conditions.append(f"{security_column} IN ({placeholders})")
+            params.extend(id_values)
+    if start_value is not None:
+        conditions.append(f"{date_column} >= ?")
+        params.append(start_value)
+    if end_value is not None:
+        conditions.append(f"{date_column} <= ?")
+        params.append(end_value)
+    return conditions, params
+
+
+def _normalize_nullable_price_scalar(value: object) -> object:
+    if not pd.api.types.is_scalar(value):
+        raise TypeError("nullable price fact values must be scalars")
+    return None if bool(pd.isna(value)) else value
+
+
+def _price_fact_values(values: dict[str, object]) -> tuple[object, ...]:
+    return tuple(
+        _normalize_nullable_price_scalar(values[field])
+        if field in PRICE_NULLABLE_FIELDS
+        else values[field]
+        for field in PRICE_FACT_FIELDS
+    )
+
+
+def save_stock_daily_prices(
+    frame: pd.DataFrame,
+    *,
+    database_path: str | PathLike[str],
+) -> StockDailyPriceSaveResult:
+    """Atomically insert or revise explicit stock daily price facts."""
+    normalized = normalize_stock_daily_prices(frame)
+    if normalized.empty:
+        return StockDailyPriceSaveResult(0, 0, 0, 0)
+
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    saved_at = datetime.now(timezone.utc).isoformat()
+    inserted = revised = unchanged = revision_rows = 0
+
+    try:
+        with sqlite3.connect(path) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            for record in normalized.to_dict("records"):
+                security_id = record["security_id"]
+                if connection.execute(
+                    "SELECT 1 FROM security_master WHERE security_id = ?",
+                    (security_id,),
+                ).fetchone() is None:
+                    raise ValueError(f"Unknown security_id: {security_id}")
+
+                key = (
+                    security_id,
+                    record["trade_date"],
+                    record["adjustment"],
+                    record["source"],
+                )
+                new_facts = _price_fact_values(record)
+                existing = connection.execute(
+                    """
+                    SELECT provider_adjustment, open, high, low, close, volume,
+                           volume_unit, amount, amount_unit, is_final,
+                           provider_as_of_date, observed_at, updated_at
+                    FROM stock_daily_price
+                    WHERE security_id = ? AND trade_date = ?
+                      AND adjustment = ? AND source = ?
+                    """,
+                    key,
+                ).fetchone()
+
+                if existing is None:
+                    connection.execute(
+                        """
+                        INSERT INTO stock_daily_price (
+                            security_id, trade_date, adjustment, source,
+                            provider_adjustment, open, high, low, close, volume,
+                            volume_unit, amount, amount_unit, is_final,
+                            provider_as_of_date, observed_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        key + new_facts + (record["observed_at"], saved_at),
+                    )
+                    inserted += 1
+                    continue
+
+                old_facts = tuple(
+                    _normalize_nullable_price_scalar(value)
+                    if field in PRICE_NULLABLE_FIELDS
+                    else value
+                    for field, value in zip(
+                        PRICE_FACT_FIELDS,
+                        existing[: len(PRICE_FACT_FIELDS)],
+                    )
+                )
+                old_observed_at = str(existing[len(PRICE_FACT_FIELDS)])
+                if old_facts == new_facts:
+                    if datetime.fromisoformat(record["observed_at"]) > datetime.fromisoformat(
+                        old_observed_at
+                    ):
+                        connection.execute(
+                            """
+                            UPDATE stock_daily_price
+                            SET observed_at = ?
+                            WHERE security_id = ? AND trade_date = ?
+                              AND adjustment = ? AND source = ?
+                            """,
+                            (record["observed_at"],) + key,
+                        )
+                    unchanged += 1
+                    continue
+
+                if datetime.fromisoformat(record["observed_at"]) <= datetime.fromisoformat(
+                    old_observed_at
+                ):
+                    raise ValueError(
+                        f"Price revision observed_at must advance for key: {key!r}"
+                    )
+
+                changed_fields = ",".join(
+                    field
+                    for field, old_value, new_value in zip(
+                        PRICE_FACT_FIELDS, old_facts, new_facts
+                    )
+                    if old_value != new_value
+                )
+                revision_number = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(revision_number), 0) + 1
+                    FROM stock_daily_price_revision
+                    WHERE security_id = ? AND trade_date = ?
+                      AND adjustment = ? AND source = ?
+                    """,
+                    key,
+                ).fetchone()[0]
+                connection.execute(
+                    """
+                    INSERT INTO stock_daily_price_revision (
+                        security_id, trade_date, adjustment, source,
+                        revision_number, changed_fields,
+                        old_provider_adjustment, old_open, old_high, old_low,
+                        old_close, old_volume, old_volume_unit, old_amount,
+                        old_amount_unit, old_is_final, old_provider_as_of_date,
+                        old_observed_at,
+                        new_provider_adjustment, new_open, new_high, new_low,
+                        new_close, new_volume, new_volume_unit, new_amount,
+                        new_amount_unit, new_is_final, new_provider_as_of_date,
+                        new_observed_at, revised_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    key
+                    + (revision_number, changed_fields)
+                    + old_facts
+                    + (old_observed_at,)
+                    + new_facts
+                    + (record["observed_at"], saved_at),
+                )
+                connection.execute(
+                    """
+                    UPDATE stock_daily_price
+                    SET provider_adjustment = ?, open = ?, high = ?, low = ?,
+                        close = ?, volume = ?, volume_unit = ?, amount = ?,
+                        amount_unit = ?, is_final = ?, provider_as_of_date = ?,
+                        observed_at = ?, updated_at = ?
+                    WHERE security_id = ? AND trade_date = ?
+                      AND adjustment = ? AND source = ?
+                    """,
+                    new_facts
+                    + (record["observed_at"], saved_at)
+                    + key,
+                )
+                revised += 1
+                revision_rows += 1
+    except sqlite3.Error as exc:
+        raise RuntimeError("Unable to save stock daily prices") from exc
+
+    return StockDailyPriceSaveResult(
+        inserted=inserted,
+        revised=revised,
+        unchanged=unchanged,
+        revision_rows=revision_rows,
+    )
+
+
+def load_stock_daily_prices(
+    *,
+    database_path: str | PathLike[str],
+    adjustment: str,
+    source: str,
+    security_ids: Iterable[int] | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    """Load explicit price facts with security identity and provenance."""
+    conditions, params = _price_query_filters(
+        adjustment=adjustment,
+        source=source,
+        security_ids=security_ids,
+        start_date=start_date,
+        end_date=end_date,
+        security_column="price.security_id",
+        date_column="price.trade_date",
+    )
+    query = f"""
+    SELECT price.security_id, master.exchange, master.asset_type,
+           master.local_symbol, master.board, price.trade_date,
+           price.adjustment, price.source, price.provider_adjustment,
+           price.open, price.high, price.low, price.close, price.volume,
+           price.volume_unit, price.amount, price.amount_unit, price.is_final,
+           price.provider_as_of_date, price.observed_at, price.updated_at
+    FROM stock_daily_price AS price
+    INNER JOIN security_master AS master
+        ON master.security_id = price.security_id
+    WHERE {' AND '.join(conditions)}
+    ORDER BY price.security_id, price.trade_date, price.adjustment, price.source
+    """
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            result = pd.read_sql_query(query, connection, params=params)
+    except (sqlite3.Error, pd.errors.DatabaseError) as exc:
+        raise RuntimeError("Unable to load stock daily prices") from exc
+    result = result.loc[:, list(STOCK_DAILY_PRICE_RESULT_COLUMNS)]
+    if not result.empty:
+        result["volume"] = result["volume"].astype("int64")
+        result["is_final"] = result["is_final"].astype(bool)
+    return result
+
+
+def load_stock_daily_price_revisions(
+    *,
+    database_path: str | PathLike[str],
+    adjustment: str,
+    source: str,
+    security_ids: Iterable[int] | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    """Load ordered price revision history with old and new facts."""
+    conditions, params = _price_query_filters(
+        adjustment=adjustment,
+        source=source,
+        security_ids=security_ids,
+        start_date=start_date,
+        end_date=end_date,
+        security_column="price.security_id",
+        date_column="price.trade_date",
+    )
+    query = f"""
+    SELECT revision.revision_id, revision.security_id, master.exchange,
+           master.asset_type, master.local_symbol, master.board,
+           revision.trade_date, revision.adjustment, revision.source,
+           revision.revision_number, revision.changed_fields,
+           revision.old_provider_adjustment, revision.old_open,
+           revision.old_high, revision.old_low, revision.old_close,
+           revision.old_volume, revision.old_volume_unit, revision.old_amount,
+           revision.old_amount_unit, revision.old_is_final,
+           revision.old_provider_as_of_date, revision.old_observed_at,
+           revision.new_provider_adjustment, revision.new_open,
+           revision.new_high, revision.new_low, revision.new_close,
+           revision.new_volume, revision.new_volume_unit, revision.new_amount,
+           revision.new_amount_unit, revision.new_is_final,
+           revision.new_provider_as_of_date, revision.new_observed_at,
+           revision.revised_at
+    FROM stock_daily_price_revision AS revision
+    INNER JOIN stock_daily_price AS price
+        ON price.security_id = revision.security_id
+       AND price.trade_date = revision.trade_date
+       AND price.adjustment = revision.adjustment
+       AND price.source = revision.source
+    INNER JOIN security_master AS master
+        ON master.security_id = revision.security_id
+    WHERE {' AND '.join(conditions)}
+    ORDER BY revision.security_id, revision.trade_date, revision.adjustment,
+             revision.source, revision.revision_number
+    """
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            result = pd.read_sql_query(query, connection, params=params)
+    except (sqlite3.Error, pd.errors.DatabaseError) as exc:
+        raise RuntimeError("Unable to load stock daily price revisions") from exc
+    result = result.loc[:, list(STOCK_DAILY_PRICE_REVISION_RESULT_COLUMNS)]
+    if not result.empty:
+        result["old_volume"] = result["old_volume"].astype("int64")
+        result["new_volume"] = result["new_volume"].astype("int64")
+        result["old_is_final"] = result["old_is_final"].astype(bool)
+        result["new_is_final"] = result["new_is_final"].astype(bool)
+    return result
+
+
+def load_latest_stock_daily_price_dates(
+    *,
+    database_path: str | PathLike[str],
+    adjustment: str,
+    source: str,
+    security_ids: Iterable[int] | None = None,
+) -> pd.DataFrame:
+    """Return latest existing dates for an explicit source and adjustment."""
+    adjustment_value = validate_price_adjustment(adjustment)
+    source_value = validate_price_source(source)
+    id_values = _price_security_id_values(security_ids)
+    conditions = ["adjustment = ?", "source = ?"]
+    params: list[object] = [adjustment_value, source_value]
+    if id_values is not None:
+        if not id_values:
+            conditions.append("0")
+        else:
+            placeholders = ",".join("?" for _ in id_values)
+            conditions.append(f"security_id IN ({placeholders})")
+            params.extend(id_values)
+    query = f"""
+    SELECT security_id, MAX(trade_date) AS latest_trade_date
+    FROM stock_daily_price
+    WHERE {' AND '.join(conditions)}
+    GROUP BY security_id
+    ORDER BY security_id
+    """
+    path = _prepare_database_path(database_path)
+    init_database(path)
+    try:
+        with sqlite3.connect(path) as connection:
+            result = pd.read_sql_query(query, connection, params=params)
+    except (sqlite3.Error, pd.errors.DatabaseError) as exc:
+        raise RuntimeError("Unable to load latest stock daily price dates") from exc
+    return result.loc[:, list(LATEST_STOCK_DAILY_PRICE_DATE_COLUMNS)]
