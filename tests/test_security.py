@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
+
 import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
@@ -9,6 +11,7 @@ from pandas.testing import assert_frame_equal
 from src.data.security import (
     SECURITY_LISTING_EVENT_COLUMNS,
     SECURITY_MASTER_COLUMNS,
+    SecurityIdentity,
     normalize_security_listing_events,
     normalize_security_master,
 )
@@ -278,3 +281,88 @@ def test_normalize_security_listing_events_rejects_duplicate_event_key():
     data = pd.concat([listing_events(), listing_events()], ignore_index=True)
     with pytest.raises(ValueError, match="Duplicate security listing event key"):
         normalize_security_listing_events(data)
+
+
+def identity(**changes) -> SecurityIdentity:
+    values = {
+        "security_id": 1,
+        "exchange": "XSHG",
+        "asset_type": "COMMON_STOCK",
+        "local_symbol": "600000",
+        "board": "SSE_MAIN",
+        "current_listing_status": "LISTED",
+        "list_date": "1999-11-10",
+        "delist_date": None,
+    }
+    values.update(changes)
+    return SecurityIdentity(**values)
+
+
+def test_security_identity_is_validated_and_frozen():
+    value = identity()
+    assert value.security_id == 1
+    assert value.local_symbol == "600000"
+    with pytest.raises(FrozenInstanceError):
+        value.local_symbol = "600001"
+
+
+@pytest.mark.parametrize("security_id", [0, -1, True, 1.0, "1", None])
+def test_security_identity_rejects_invalid_security_id(security_id):
+    with pytest.raises(ValueError, match="security_id"):
+        identity(security_id=security_id)
+
+
+@pytest.mark.parametrize(
+    "local_symbol",
+    [
+        "６０００００",
+        "٦٠٠٠٠٠",
+        "60000０",
+    ],
+)
+def test_security_identity_rejects_unicode_digits(local_symbol):
+    with pytest.raises(ValueError, match="local_symbol"):
+        identity(local_symbol=local_symbol)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("exchange", "XBSE"),
+        ("asset_type", "ETF"),
+        ("local_symbol", "60000A"),
+        ("board", "BSE_MAIN"),
+        ("current_listing_status", "SUSPENDED"),
+        ("list_date", "19991110"),
+        ("delist_date", "invalid"),
+    ],
+)
+def test_security_identity_rejects_invalid_identity_fields(field, value):
+    changes = {field: value}
+    if field == "delist_date":
+        changes["current_listing_status"] = "DELISTED"
+    with pytest.raises(ValueError, match=field):
+        identity(**changes)
+
+
+def test_security_identity_rejects_exchange_board_mismatch():
+    with pytest.raises(ValueError, match="exchange/board"):
+        identity(exchange="XSHE")
+
+
+def test_security_identity_rejects_delist_before_list():
+    with pytest.raises(ValueError, match="precedes"):
+        identity(
+            current_listing_status="DELISTED",
+            delist_date="1990-01-01",
+        )
+
+
+def test_security_identity_rejects_listed_with_delist_date():
+    with pytest.raises(ValueError, match="LISTED"):
+        identity(delist_date="2026-07-22")
+
+
+def test_security_identity_rejects_delisted_without_delist_date():
+    with pytest.raises(ValueError, match="DELISTED"):
+        identity(current_listing_status="DELISTED")

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
+from numbers import Integral
 from typing import Final
 
 import pandas as pd
@@ -49,6 +51,55 @@ EXCHANGE_BOARD_PAIRS: Final[frozenset[tuple[str, str]]] = frozenset(
         ("XSHE", "SZSE_CHINEXT"),
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class SecurityIdentity:
+    """Immutable, strictly validated identity required by market-data providers."""
+
+    security_id: int
+    exchange: str
+    asset_type: str
+    local_symbol: str
+    board: str
+    current_listing_status: str
+    list_date: str
+    delist_date: str | None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.security_id, bool)
+            or not isinstance(self.security_id, Integral)
+            or self.security_id <= 0
+        ):
+            raise ValueError(f"Invalid security_id: {self.security_id!r}")
+        if self.exchange not in SECURITY_EXCHANGES:
+            raise ValueError(f"Invalid exchange: {self.exchange!r}")
+        if self.asset_type not in SECURITY_ASSET_TYPES:
+            raise ValueError(f"Invalid asset_type: {self.asset_type!r}")
+        validate_local_symbol(self.local_symbol)
+        if self.board not in SECURITY_BOARDS:
+            raise ValueError(f"Invalid board: {self.board!r}")
+        if (self.exchange, self.board) not in EXCHANGE_BOARD_PAIRS:
+            raise ValueError(
+                "Invalid exchange/board combination: "
+                f"{self.exchange}/{self.board}"
+            )
+        if self.current_listing_status not in SECURITY_LISTING_STATUSES:
+            raise ValueError(
+                "Invalid current_listing_status: "
+                f"{self.current_listing_status!r}"
+            )
+        _iso_date(self.list_date, "list_date", 0)
+        if self.delist_date is not None:
+            _iso_date(self.delist_date, "delist_date", 0)
+            if self.delist_date < self.list_date:
+                raise ValueError("delist_date precedes list_date")
+        if self.current_listing_status == "LISTED" and self.delist_date is not None:
+            raise ValueError("LISTED security must not have delist_date")
+        if self.current_listing_status == "DELISTED" and self.delist_date is None:
+            raise ValueError("DELISTED security must have delist_date")
+        object.__setattr__(self, "security_id", int(self.security_id))
 
 
 def _is_missing(value: object) -> bool:

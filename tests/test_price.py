@@ -22,6 +22,8 @@ from src.data.database import (
     save_stock_daily_prices,
 )
 from src.data.price import (
+    PriceProviderError,
+    PriceProviderErrorCode,
     STOCK_DAILY_PRICE_COLUMNS,
     StockDailyPriceSaveResult,
     normalize_stock_daily_prices,
@@ -216,6 +218,44 @@ def test_normalizer_rejects_invalid_ohlc_relationship(changes):
 def test_normalizer_rejects_invalid_volume(volume):
     with pytest.raises(ValueError, match="volume"):
         normalize_stock_daily_prices(price_frame(volume=volume))
+
+
+def test_price_provider_error_codes_are_complete_and_stable():
+    assert {item.value for item in PriceProviderErrorCode} == {
+        "NETWORK_CONFIGURATION",
+        "PROXY_UNAVAILABLE",
+        "DNS_FAILURE",
+        "CONNECTION_CLOSED",
+        "TIMEOUT",
+        "HTTP_RETRYABLE",
+        "HTTP_FINAL",
+        "PROVIDER_REJECTED",
+        "INVALID_JSON",
+        "INVALID_SCHEMA",
+        "IDENTITY_MISMATCH",
+        "INVALID_DATA",
+        "NO_DATA",
+    }
+
+
+def test_price_provider_error_exposes_machine_readable_safe_attributes():
+    error = PriceProviderError(
+        "safe provider failure",
+        provider="EASTMONEY",
+        code=PriceProviderErrorCode.TIMEOUT,
+        retryable=True,
+        batch_signal=False,
+        attempts=2,
+    )
+    assert str(error) == "safe provider failure"
+    assert error.provider == "EASTMONEY"
+    assert error.code is PriceProviderErrorCode.TIMEOUT
+    assert error.retryable
+    assert not error.batch_signal
+    assert error.attempts == 2
+    assert error.status_code is None
+    assert "password" not in str(error).lower()
+    assert "proxy" not in str(error).lower()
 
 
 @pytest.mark.parametrize("unit", ["", "HAND", "share", None])

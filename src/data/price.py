@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from enum import Enum
 from numbers import Integral, Real
 from typing import Final
 
@@ -57,6 +58,47 @@ PRICE_FACT_FIELDS: Final[tuple[str, ...]] = (
     "is_final",
     "provider_as_of_date",
 )
+
+
+class PriceProviderErrorCode(str, Enum):
+    """Machine-readable failures shared by strict price providers."""
+
+    NETWORK_CONFIGURATION = "NETWORK_CONFIGURATION"
+    PROXY_UNAVAILABLE = "PROXY_UNAVAILABLE"
+    DNS_FAILURE = "DNS_FAILURE"
+    CONNECTION_CLOSED = "CONNECTION_CLOSED"
+    TIMEOUT = "TIMEOUT"
+    HTTP_RETRYABLE = "HTTP_RETRYABLE"
+    HTTP_FINAL = "HTTP_FINAL"
+    PROVIDER_REJECTED = "PROVIDER_REJECTED"
+    INVALID_JSON = "INVALID_JSON"
+    INVALID_SCHEMA = "INVALID_SCHEMA"
+    IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
+    INVALID_DATA = "INVALID_DATA"
+    NO_DATA = "NO_DATA"
+
+
+class PriceProviderError(RuntimeError):
+    """Typed provider failure without embedding sensitive request context."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        code: PriceProviderErrorCode,
+        retryable: bool,
+        batch_signal: bool,
+        attempts: int,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.code = code
+        self.retryable = retryable
+        self.batch_signal = batch_signal
+        self.attempts = attempts
+        self.status_code = status_code
 
 
 @dataclass(frozen=True, slots=True)
